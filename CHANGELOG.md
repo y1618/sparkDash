@@ -11,6 +11,7 @@ Format: version sections are listed newest first.
 
 ### Added
 - **Tailnet monitoring** — opt-in per unit (`tailscaleMonitoring`, default **off**); `tailscale status --json` on the host and a Tailnet card under Resources. Flags a unit that is healthy on the LAN but off its tailnet. ([#43](https://github.com/MiaAI-Lab/sparkDash/pull/43))
+- **LM Studio backend** — OpenAI-compatible servers reporting `owned_by: organization_owner` are detected as `lmstudio` (badge **LM Studio**). Model + context come from LM Studio's native `/api/v0/models` (first *loaded* LLM/VLM, `loaded_context_length`; falls back to `/v1/models`), read at most every 10 s. No live tok/s (LM Studio has no counters); decode benchmark and Prompt Showcase are unaffected.
 
 ### Security
 - **`BIND_HOST` now defaults to `127.0.0.1` (loopback) instead of `0.0.0.0`** — the dashboard is unauthenticated and can SSH into and power off Sparks, so it is no longer reachable on the LAN by default. Set `BIND_HOST` to the host's LAN IP (or `0.0.0.0`) to opt in to remote access. **Migration:** if you access sparkDash from another machine via bare-metal `npm start`, set `BIND_HOST` explicitly. Production and dev Compose both set `BIND_HOST=0.0.0.0` (`network_mode: host`). Startup now also warns when bound to a non-loopback address. ([#35](https://github.com/MiaAI-Lab/sparkDash/pull/35))
@@ -18,6 +19,7 @@ Format: version sections are listed newest first.
 ### Fixed
 - Decode bench `POST /api/sparks/:id/llm/bench` rejects LLM ports that are not in the Spark's configured list (same allowlist as showcase). ([#45](https://github.com/MiaAI-Lab/sparkDash/pull/45))
 - **Host CPU temperature** — dedicated GPU hosts (`kind: host`) show CPU temp on the RAM panel and Overview (hidden at 0°C / no sensor). Remote hosts now read hwmon/thermal over SSH. DGX Sparks still do not display CPU temp (remote Sparks still skip the extra sensor SSH). ([#34](https://github.com/MiaAI-Lab/sparkDash/pull/34))
+- **LM Studio error-log spam / misdetection as SGLang** — LM Studio answers every unknown path with HTTP 200 + `{"error": …}`, which the SGLang check read as "server info", so each 2 s poll hit `/get_server_info`, `/metrics`, `/get_model_info`, `/model_info` (each logged as an ERROR in LM Studio's Developer Logs), and the Showcase rate poller hit `/metrics` + `/get_server_info` every 400 ms. The SGLang check now rejects bare error envelopes, LM Studio is classified from `owned_by` before any network probe, and the showcase poller stops after three initial misses on counter-less backends (also quiets llama.cpp 404s).
 
 ### Changed
 - README architecture diagram top border aligned with the box. ([#39](https://github.com/MiaAI-Lab/sparkDash/pull/39))

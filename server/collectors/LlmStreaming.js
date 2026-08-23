@@ -11,6 +11,12 @@ const DEBUG_HEADER_RE =
 
 /** Truncate streamed content previews stored for debugging. */
 export const CONTENT_PREVIEW_CHARS = 160;
+/**
+ * pollServerGenerationRates: stop after this many *initial* null reads.
+ * Backends without counters (llama.cpp, LM Studio, …) answer null forever —
+ * and LM Studio logs every /metrics + /get_server_info miss as an ERROR.
+ */
+const SERVER_RATE_INITIAL_MISS_LIMIT = 3;
 
 export function round2(n) {
   return Math.round(n * 100) / 100;
@@ -206,7 +212,8 @@ function extractDeltaPieces(choice) {
 
 /**
  * Apply per-model thinking flags so reasoning models don't 400.
- * MiniMax-M3 needs `thinking_mode`; most others use `enable_thinking`.
+ * MiniMax-M3 needs `thinking_mode`; DeepSeek V4 needs `thinking`;
+ * most others use `enable_thinking`.
  *
  * @param {Record<string, unknown>} body
  * @param {string | null | undefined} modelId
@@ -226,6 +233,10 @@ export function applyThinkingFlags(body, modelId, think = true) {
   if (id.includes("minimax") || /(^|[^a-z])m3([^a-z]|$)/.test(id)) {
     ctk.thinking_mode = think ? "enabled" : "disabled";
   }
+  // DeepSeek V4 templates use `thinking` and ignore enable_thinking
+  if (id.includes("deepseek")) {
+    ctk.thinking = think;
+  }
   body.chat_template_kwargs = ctk;
   return body;
 }
@@ -240,6 +251,7 @@ export function stripThinkingFlags(body) {
     const ctk = { ...body.chat_template_kwargs };
     delete ctk.enable_thinking;
     delete ctk.thinking_mode;
+    delete ctk.thinking;
     if (Object.keys(ctk).length) body.chat_template_kwargs = ctk;
     else delete body.chat_template_kwargs;
   }
@@ -268,8 +280,12 @@ export async function pollServerGenerationRates(
   let lastTokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
   let lastT = performance.now();
   const onSample = typeof opts.onSample === "function" ? opts.onSample : null;
+  // Give up on backends that never answer with counters instead of hammering
+  // them every `intervalMs` for the whole session (see SERVER_RATE_INITIAL_MISS_LIMIT).
+  let initialMisses = lastTokens == null ? 1 : 0;
 
   while (!signal.aborted) {
+    if (initialMisses >= SERVER_RATE_INITIAL_MISS_LIMIT) break;
     try {
       await sleep(intervalMs, signal);
     } catch {
@@ -281,6 +297,8 @@ export async function pollServerGenerationRates(
       if (tokens != null) {
         lastTokens = tokens;
         lastT = now;
+      } else if (lastTokens == null) {
+        initialMisses += 1;
       }
       continue;
     }
