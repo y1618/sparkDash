@@ -232,8 +232,10 @@ test("pollServerGenerationRates: gives up after a few initial misses on a counte
     assert.equal(ac.signal.aborted, false, "returned on its own, not via the safety abort");
     assert.equal(res.samples, 0);
     assert.equal(res.median, null);
-    // 3 reads × (/metrics + /get_server_info) — then silence.
-    assert.equal(calls.length, 6, `expected 6 requests, got ${calls.length}: ${calls.join(",")}`);
+    // 3 reads — each fans out to /metrics, /health, and the SGLang info paths — then silence.
+    const reads = calls.filter((p) => p === "/metrics").length;
+    assert.equal(reads, 3, `expected 3 reads, got ${reads}: ${calls.join(",")}`);
+    assert.equal(calls.length, reads * new Set(calls).size, "one hit per endpoint per read");
   } finally {
     globalThis.fetch = realFetch;
   }

@@ -95,6 +95,10 @@ export function ingestSnapshots(sparks: SparkSnapshot[]): void {
     }
     if (m.cpu) {
       pushHistory(`${s.id}:cpu.usage`, m.cpu.usage);
+      // Skip 0°C so a missing sensor does not draw a fake floor on the sparkline.
+      if (m.cpu.temperature > 0) {
+        pushHistory(`${s.id}:cpu.temp`, m.cpu.temperature);
+      }
     }
     if (m.ram) {
       pushHistory(`${s.id}:ram.percentage`, m.ram.percentage);
@@ -108,6 +112,12 @@ export function ingestSnapshots(sparks: SparkSnapshot[]): void {
         const portKey = port != null ? `:${port}` : `:${i}`;
         pushHistory(`${s.id}:llm${portKey}.tps`, llm.generationTps);
         pushHistory(`${s.id}:llm${portKey}.prefill`, llm.prefillTps);
+        if (llm.cachedPrefillTps != null) {
+          pushHistory(`${s.id}:llm${portKey}.prefillCached`, llm.cachedPrefillTps);
+        }
+        if (llm.uncachedPrefillTps != null) {
+          pushHistory(`${s.id}:llm${portKey}.prefillUncached`, llm.uncachedPrefillTps);
+        }
       }
     }
     if (m.comfy?.available) {

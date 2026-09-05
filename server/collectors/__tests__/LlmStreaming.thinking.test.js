@@ -1,14 +1,20 @@
 /**
- * Unit tests for per-model thinking flag mapping.
+ * Unit tests for thinking flag mapping — in particular DeepSeek V4, whose
+ * template only honors `thinking` (not `enable_thinking`). A bench that fails
+ * to disable thinking on DeepSeek reads ~35% low.
  * Run: npm test
  */
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import { applyThinkingFlags, stripThinkingFlags } from "../LlmStreaming.js";
 
-test("applyThinkingFlags: default models get enable_thinking only", () => {
+test("applyThinkingFlags: every model gets enable_thinking, thinking, and thinking_mode", () => {
   const body = applyThinkingFlags({}, "qwen3-32b", false);
-  assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+  assert.deepEqual(body.chat_template_kwargs, {
+    enable_thinking: false,
+    thinking: false,
+    thinking_mode: "disabled",
+  });
 });
 
 test("applyThinkingFlags: MiniMax gets thinking_mode", () => {
