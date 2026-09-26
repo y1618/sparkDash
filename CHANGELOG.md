@@ -11,9 +11,37 @@ Format: version sections are listed newest first.
 
 ### Added
 - **LM Studio backend** — OpenAI-compatible servers reporting `owned_by: organization_owner` are detected as `lmstudio` (badge **LM Studio**). Model + context come from LM Studio's native `/api/v0/models` (first *loaded* LLM/VLM, `loaded_context_length`; falls back to `/v1/models`), read at most every 10 s. No live tok/s (LM Studio has no counters); decode benchmark and Prompt Showcase are unaffected.
+- **Custom prefill size** — type any token count from 256–300k in the prefill benchmark (plus the preset chips).
+- **q27 LLM backend** — detect signalnine/q27 via `/v1/models` ownership or `q27_*` Prometheus series; report backend-aware decode/prefill rates and inference-health telemetry.
+- **Hide worker nodes** — Settings toggle. Worker-role Sparks drop off Overview cards and the tab bar (the open worker tab stays). Direct URLs and batch Wake / Shutdown / Hermes still include them.
+- **On-demand Remote bench** — a **Remote** button next to decode/prefill opens a host + port (HTTPS) field. Paste a Tailscale URL such as `https://name.ts.net/v1/models`; nothing is probed until you run Decode or Prefill against it.
+- **Decode / prefill benches on remote Sparks** — if the remote LLM is not reachable on its LAN IP (loopback-only bind), sparkDash opens an SSH local-forward to `127.0.0.1:<port>` for the job. Bench buttons stay on the LLM card even when the live probe shows no model.
+- **Benchmark share image** — the decode/prefill **Copy results** button is now a split button: the label copies the text summary as before, and the caret on its right offers **Copy as text** / **Copy as image** on hover or click. The image is a 1200×675-or-taller card drawn in the app's dark palette with the sparkDash mark, the unit, the model, one row per level and the same legend the dialog shows. On by default (Settings → **Benchmark share image** turns it off, restoring the plain text button); it copies where the page has an image clipboard — HTTPS or localhost — and otherwise downloads the PNG, and says so in the menu rather than pretending.
 
 ### Fixed
 - **LM Studio error-log spam / misdetection as SGLang** — LM Studio answers every unknown path with HTTP 200 + `{"error": …}`, which the SGLang check read as "server info", so each 2 s poll hit `/get_server_info`, `/metrics`, `/get_model_info`, `/model_info` (each logged as an ERROR in LM Studio's Developer Logs), and the Showcase rate poller hit `/metrics` + `/get_server_info` every 400 ms. The SGLang check now rejects bare error envelopes, LM Studio is classified from `owned_by` before any network probe, and the showcase poller stops after three initial misses on counter-less backends (also quiets llama.cpp 404s).
+- **Decode bench “Too many benchmark requests”** — start quota was 6/min stacked with a 2/min cooldown, and failed retries still burned the quota. Starts are now 20/min, cooldown is 3s (double-click only), and 400/409 responses do not count.
+- **Decode bench 24×/32× work budget ([#93](https://github.com/MiaAI-Lab/sparkDash/issues/93))** — the post-1.8.6 security cap (131k total tokens) rejected a full concurrency sweep at 2048 max tokens. The cap is 262k so every advertised level fits.
+- **Prefill bench still dying at ~5 min** — Node undici aborts streams with no headers/body after 300s. Long prefills now use an Agent with those idle timeouts disabled; the per-size AbortSignal remains the bound.
+- **SGLang live Prefill tok/s latching ([#99](https://github.com/MiaAI-Lab/sparkDash/issues/99))** — the poll picked its Prometheus applier from the *displayed* rates, so a non-zero prefill kept selecting the cache-split path (which by design never writes `prefillTps`) and the value could not return to 0. Which applier runs now depends on whether `/server_info` carries `total_*` counters on that poll. The token baseline is also seeded outside the rate window, so the first poll after a restart no longer turns the engine's lifetime prompt counter into a rate.
+- **`SPARKDASH_TOKEN` never reached the container ([#86](https://github.com/MiaAI-Lab/sparkDash/pull/86))** — the compose file did not pass it through, so a `BIND_HOST=0.0.0.0` install failed closed no matter what `.env` said. The empty default still reads as "no token".
+- **Tailscale addresses classified as public ([#89](https://github.com/MiaAI-Lab/sparkDash/pull/89))** — `100.64.0.0/10`, where a tailnet lives, now reads as LAN on the endpoint-exposure indicator.
+- **SGLang served model ID ([#95](https://github.com/MiaAI-Lab/sparkDash/pull/95))** — the panel and the bench requests use the id from `/v1/models` (what the server accepts), keeping the native storage path on `modelPath`.
+- **Remote SSH session churn** — collectors reuse an authenticated SSH transport instead of creating a full SSH/PAM login for every metric poll. `SSH_CONTROL_PERSIST_SECONDS=0` restores one connection per command if needed.
+
+---
+
+## [1.8.8] — 2026-09-22
+
+### Fixed
+- **SGLang overview tok/s stuck at 0** — `generation_tokens_total` on current SGLang builds only moves when a request finishes, so the live rate was 0 for the whole decode and then one spiked poll. Overview now uses `gen_throughput` while a request is running.
+
+---
+
+## [1.8.7] — 2026-09-22
+
+### Changed
+- **Decode bench code concurrency** — each concurrent code stream is a different Python task (binary search, LRU, …), starting with its own name so the prompts do not share a prefix. The code warmup is a separate `warmup_noop` prompt, so stream 1 is not a cache hit of the warmup. Concurrency 1 is `binary_search`.
 
 ---
 
@@ -58,6 +86,7 @@ Format: version sections are listed newest first.
 ### Added
 - **EXL3 live tok/s** — detect ExLlamaV3 `tools/serve_openai.py` (`owned_by: exl3` or `/health` `{ok, busy}`) instead of mislabeling it as vLLM. Generation and prefill tok/s come from `/health` cumulative token counters (no Prometheus `/metrics`).
 - **Tailnet monitoring** — opt-in per unit (`tailscaleMonitoring`, default **off**); `tailscale status --json` on the host and a Tailnet card under Resources. Flags a unit that is healthy on the LAN but off its tailnet. ([#43](https://github.com/MiaAI-Lab/sparkDash/pull/43))
+- **NV_ERR_NO_MEMORY on the GPU panel** — count of NVRM `NV_ERR_NO_MEMORY` kernel log lines since boot (shown when > 0). Journal is scanned at most once a minute, not on the 2s poll. Replaces the approach in [#40](https://github.com/MiaAI-Lab/sparkDash/pull/40).
 
 ### Security
 - **`BIND_HOST` now defaults to `127.0.0.1` (loopback) instead of `0.0.0.0`** — the dashboard is unauthenticated and can SSH into and power off Sparks, so it is no longer reachable on the LAN by default. Set `BIND_HOST` to the host's LAN IP (or `0.0.0.0`) to opt in to remote access. **Migration:** if you access sparkDash from another machine via bare-metal `npm start`, set `BIND_HOST` explicitly. Production and dev Compose both set `BIND_HOST=0.0.0.0` (`network_mode: host`). Startup now also warns when bound to a non-loopback address. ([#35](https://github.com/MiaAI-Lab/sparkDash/pull/35))

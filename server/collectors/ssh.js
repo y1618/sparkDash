@@ -6,14 +6,110 @@
  * Password auth uses sshpass -e (password via env), not -p on the command line.
  */
 import { execFile } from "child_process";
+import crypto from "crypto";
 import fs from "fs";
-import { COMFY_PORT, COMFY_PROBE_TIMEOUT_MS, SSH_CONNECT_TIMEOUT } from "../config.js";
+import os from "os";
+import path from "path";
+import {
+  COMFY_PORT,
+  COMFY_PROBE_TIMEOUT_MS,
+  SSH_CONNECT_TIMEOUT,
+  SSH_CONTROL_PERSIST,
+  SSH_MULTIPLEX,
+} from "../config.js";
 import { isAllowedTargetHost, isValidSshUser } from "../validate.js";
 import { llmProbeHost } from "./llmHost.js";
 
 // Detect sshpass without shelling out to `which` on every cold call —
 // checking PATH entries directly is faster and avoids spawning a shell.
 let _sshpassAvailable = null;
+const _multiplexStates = new Map();
+const _controlDir = fs.mkdtempSync("/tmp/sparkdash-ssh-");
+const _controlSalt = crypto.randomBytes(32);
+fs.chmodSync(_controlDir, 0o700);
+
+function controlPersistSeconds() {
+  const configured = Number.parseInt(process.env.SSH_CONTROL_PERSIST_SECONDS ?? "60", 10);
+  return Number.isFinite(configured) ? Math.min(3600, Math.max(0, configured)) : 60;
+}
+
+function ensureControlDir() {
+  fs.mkdirSync(_controlDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(_controlDir, 0o700);
+}
+
+/**
+ * Build an isolated OpenSSH control socket config. Credentials are included
+ * only in the digest so two password records cannot share an authenticated
+ * transport; the secret itself is never exposed in argv or the socket path.
+ */
+export function sshMultiplexConfig(spark, targetHost, user, auth, password) {
+  const persistSeconds = controlPersistSeconds();
+  if (persistSeconds === 0) return null;
+
+  ensureControlDir();
+  const identityFile = process.env.SSH_IDENTITY_FILE || "default";
+  const isolationKey = [spark.id, user, targetHost, auth || "key", identityFile, password || ""].join("\0");
+  const digest = crypto
+    .createHash("sha256")
+    .update(_controlSalt)
+    .update(isolationKey)
+    .digest("hex")
+    .slice(0, 24);
+  return {
+    key: digest,
+    persistSeconds,
+    args: [
+      "-o",
+      "ControlMaster=auto",
+      "-o",
+      `ControlPersist=${persistSeconds}`,
+      "-o",
+      `ControlPath=${_controlDir}/${digest}`,
+    ],
+  };
+}
+
+/** Establish or re-check the master before concurrent pollers run. */
+export async function ensureMultiplexReady(config, establish) {
+  if (!config) return;
+
+  const now = Date.now();
+  let state = _multiplexStates.get(config.key);
+  if (state && now >= state.expiresAt) {
+    _multiplexStates.delete(config.key);
+    state = null;
+  }
+
+  if (!state) {
+    state = {
+      ready: Promise.resolve().then(establish),
+      expiresAt: now + config.persistSeconds * 1000,
+    };
+    _multiplexStates.set(config.key, state);
+  }
+
+  try {
+    await state.ready;
+  } catch (err) {
+    if (_multiplexStates.get(config.key) === state) _multiplexStates.delete(config.key);
+    throw err;
+  }
+}
+
+/** Forget cached readiness after a multiplexed command fails. */
+export function invalidateMultiplex(config) {
+  if (config) _multiplexStates.delete(config.key);
+}
+
+process.once("exit", () => {
+  try {
+    fs.rmSync(_controlDir, { recursive: true, force: true });
+  } catch {
+    // ControlPersist bounds any master left behind by an abrupt shutdown.
+  }
+});
+
 function sshpassAvailable() {
   if (_sshpassAvailable !== null) return _sshpassAvailable;
   try {
@@ -55,21 +151,73 @@ function sshpassAvailable() {
 }
 
 /**
- * Execute a command on a remote Spark via SSH.
+ * `-o` flags that let every poll ride an already-authenticated connection.
  *
- * @param {Object} spark - Spark config object
- * @param {string} cmd - Command to execute (passed as a single remote argv via bash -c)
- * @param {{ timeoutMs?: number }} [options]
- * @returns {Promise<string>} - Trimmed stdout
+ * Without them each collector tick pays for a fresh TCP connect, key exchange
+ * and authentication. At the default cadence a single remote Spark takes 217
+ * of those per minute, and on password auth the KDF alone dominates the cost —
+ * the login is far more expensive than the `cat /proc/meminfo` it carries.
+ * With a shared master, the first command connects and the rest open a channel
+ * on the socket that is already up.
+ *
+ * Control-path length is the trap: the socket name is created LOCALLY, so the
+ * whole literal (directory + expanded hash) must stay under the ~104-byte
+ * sun_path limit (108 on Linux). macOS hands every process a ~60-char
+ * per-user $TMPDIR, so os.tmpdir() + the literal `%C` template — which execFile
+ * passes to ssh WITHOUT shell expansion, quotes and all — blew past the limit
+ * and every remote collector died with `unix_listener: path ... too long`.
+ *
+ * Fix: expand %C ourselves — same formula OpenSSH uses (SHA1 of
+ * "local host:user:remote host:port", hex) — and hang the socket off a short
+ * fixed /tmp dir instead of $TMPDIR. A master that died leaves a stale socket
+ * behind; `ControlMaster=auto` notices, reconnects, and replaces it.
+ *
+ * @param {{ targetHost: string, user: string }} remote
+ * @returns {string[]}
  */
-export async function sshExec(spark, cmd, options = {}) {
-  const timeoutMs =
-    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 10000;
-  const { host, user, auth, password } = spark.ssh || {};
-  const targetHost = host || spark.lanIp;
+function multiplexOpts({ targetHost, user }) {
+  if (!SSH_MULTIPLEX) return ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
+  const localHost = os.hostname();
+  const hash = crypto
+    .createHash("sha1")
+    .update(`${localHost}:${user}:${targetHost}:22`)
+    .digest("hex");
+  // /tmp/sparkdash-<40 hex> = 60 chars — under the limit on every platform,
+  // including macOS's short-sun_path world.
+  const controlPath = path.join("/tmp", `sparkdash-${hash}`);
+  return [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    `ControlPath=${controlPath}`,
+    "-o",
+    `ControlPersist=${SSH_CONTROL_PERSIST}`,
+  ];
+}
+
+/**
+ * Build file/args/env for an ssh (or sshpass) invocation. No shell interpolation.
+ *
+ * `extraSshArgs` sit after the shared ConnectTimeout / StrictHostKeyChecking
+ * options and before `-- user@host`. `remoteArgv` is the remote command (omit
+ * for `-N` tunnels).
+ *
+ * Pass `multiplex: false` for invocations that need a connection of their own
+ * — a `-N` port forward has to own its channel so that killing the process
+ * tears the forward down with it.
+ *
+ * @param {object} spark
+ * @param {{ extraSshArgs?: string[], remoteArgv?: string[], multiplex?: boolean }} [opts]
+ * @returns {{ file: string, args: string[], env: NodeJS.ProcessEnv, targetHost: string }}
+ */
+export function sshCommandSpec(spark, opts = {}) {
+  const extraSshArgs = Array.isArray(opts.extraSshArgs) ? opts.extraSshArgs : [];
+  const remoteArgv = Array.isArray(opts.remoteArgv) ? opts.remoteArgv : [];
+  const { host, user, auth, password } = spark?.ssh || {};
+  const targetHost = host || spark?.lanIp;
 
   if (!targetHost || !user) {
-    throw new Error(`SSH config missing for ${spark.id}: host=${targetHost}, user=${user}`);
+    throw new Error(`SSH config missing for ${spark?.id}: host=${targetHost}, user=${user}`);
   }
 
   if (!isAllowedTargetHost(targetHost)) {
@@ -77,10 +225,6 @@ export async function sshExec(spark, cmd, options = {}) {
   }
   if (!isValidSshUser(user)) {
     throw new Error(`SSH user not allowed: ${user}`);
-  }
-
-  if (typeof cmd !== "string" || !cmd) {
-    throw new Error("SSH command must be a non-empty string");
   }
 
   // Base SSH options (no shell metacharacters in argv)
@@ -93,8 +237,22 @@ export async function sshExec(spark, cmd, options = {}) {
   ];
 
   const remote = `${user}@${targetHost}`;
-  // Remote command as a single argument — ssh does not invoke a local shell for it
-  // when using execFile without a shell. `--` stops option parsing before destination.
+  const multiplex =
+    opts.multiplex === false || !SSH_MULTIPLEX
+      ? null
+      : sshMultiplexConfig(spark, targetHost, user, auth, password);
+  // ControlPath selection (three tiers):
+  //   - multiplex:false / SSH_MULTIPLEX=0 (tunnels, picky sshd): own connection.
+  //   - #83 global master: %C-hashed socket shared per host/user/port, so
+  //     different sparks and collectors on the same Spark share one login.
+  //   - credential-isolated digest socket (main): only when the global master
+  //     is off but a control-persist was configured — password records with the
+  //     same host/user must never share an authenticated transport.
+  const controlOpts =
+    opts.multiplex === false || !SSH_MULTIPLEX
+      ? ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+      : multiplexOpts({ targetHost, user });
+  // `--` stops option parsing before destination.
   let file;
   let args;
   // Minimal child env — only what ssh/sshpass actually need. Spreading the full
@@ -123,28 +281,75 @@ export async function sshExec(spark, cmd, options = {}) {
     // Password via env (sshpass -e) — never on argv or in process list as -p
     env.SSHPASS = password;
     file = "sshpass";
-    args = ["-e", "ssh", ...baseOpts, "--", remote, cmd];
+    args = [
+      "-e",
+      "ssh",
+      ...baseOpts,
+      ...controlOpts,
+      ...extraSshArgs,
+      "--",
+      remote,
+      ...remoteArgv,
+    ];
   } else {
     // Key-based SSH (default) — BatchMode prevents hanging on missing keys
     file = "ssh";
-    args = [...baseOpts, "-o", "BatchMode=yes"];
+    args = [...baseOpts, ...controlOpts, "-o", "BatchMode=yes"];
     const identityFile = process.env.SSH_IDENTITY_FILE;
     if (identityFile) {
       args.push("-i", identityFile);
     }
-    args.push("--", remote, cmd);
+    args.push(...extraSshArgs, "--", remote, ...remoteArgv);
   }
 
-  return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        const msg = stderr?.trim() || err.message;
-        reject(new Error(`SSH to ${targetHost} failed: ${msg}`));
-      } else {
-        resolve(String(stdout).trim());
-      }
-    });
+  return { file, args, env, targetHost, multiplex };
+}
+
+/**
+ * Execute a command on a remote Spark via SSH.
+ *
+ * @param {Object} spark - Spark config object
+ * @param {string} cmd - Command to execute (passed as a single remote argv via bash -c)
+ * @param {{ timeoutMs?: number }} [options]
+ * @returns {Promise<string>} - Trimmed stdout
+ */
+export async function sshExec(spark, cmd, options = {}) {
+  const timeoutMs =
+    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 10000;
+
+  if (typeof cmd !== "string" || !cmd) {
+    throw new Error("SSH command must be a non-empty string");
+  }
+
+  const { file, args, env, targetHost, multiplex } = sshCommandSpec(spark, {
+    remoteArgv: [cmd],
   });
+
+  const execute = (execArgs) =>
+    new Promise((resolve, reject) => {
+      execFile(file, execArgs, { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err) {
+          const msg = stderr?.trim() || err.message;
+          reject(new Error(`SSH to ${targetHost} failed: ${msg}`));
+        } else {
+          resolve(String(stdout).trim());
+        }
+      });
+    });
+
+  if (multiplex) {
+    const probeArgs = [...args];
+    probeArgs[probeArgs.length - 1] = "true";
+    await ensureMultiplexReady(multiplex, () => execute(probeArgs));
+  }
+  try {
+    return await execute(args);
+  } catch (err) {
+    // The master can die after readiness but before this exec. Never trust
+    // cached state after a transport failure; the next caller must re-probe.
+    invalidateMultiplex(multiplex);
+    throw err;
+  }
 }
 
 /**
