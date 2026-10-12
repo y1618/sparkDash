@@ -1,4 +1,5 @@
 import { BenchIcon } from "./components/bench/BenchIcon";
+import { setConfiguredTimeZone } from "./shared/timeZone";
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useSnapshot } from "./hooks/useSnapshot";
 import { useAppRoute, useRoute } from "./hooks/useRoute";
@@ -6,6 +7,7 @@ import { useSmoothWheel } from "./hooks/useSmoothWheel";
 import { fetchSparks, reorderSparks, fetchSettings, fetchHealth } from "./api/client";
 import { AppSidebar } from "./components/shell/AppSidebar";
 import { MobileTabBar } from "./components/shell/MobileTabBar";
+import { InstallPrompt } from "./components/shell/InstallPrompt";
 import { CommandPalette, type PaletteCommand } from "./components/shell/CommandPalette";
 import { openShowcase, showcaseTarget } from "./components/shell/sparkSummary";
 import { AddSparkDialog } from "./components/AddSparkDialog";
@@ -245,6 +247,10 @@ function DashboardApp() {
   const onPage = isPageId(activeId);
   const benchType = benchTypeOf(activeId);
   const hideWorkers = settings?.hideWorkers ?? false;
+  // Charts read the time zone from a module value; set it before the pages render, and
+  // re-key <main> below so a change in Settings redraws them.
+  const chartTimeZone = settings?.timeZone ?? "";
+  setConfiguredTimeZone(chartTimeZone);
   const hiddenWorkerIds = useMemo(() => {
     if (!hideWorkers) return new Set<string>();
     return new Set(
@@ -532,7 +538,7 @@ function DashboardApp() {
               stale={telemetryStale}
             />
             <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
-            <main className={telemetryStale || !connected ? "telemetry-stale" : undefined}>
+            <main key={chartTimeZone} className={telemetryStale || !connected ? "telemetry-stale" : undefined}>
               {activeId === TOKENS_ID ? (
                 <TokensPage sparks={displaySparks} onSelectSpark={navigate} />
               ) : activeId === ENERGY_ID ? (
@@ -549,9 +555,17 @@ function DashboardApp() {
                   hideOffline={settings?.autoHideOffline ?? false}
                   hideWorkers={hideWorkers}
                   showFleetEnergy={settings?.showFleetEnergy ?? true}
+                  showInferenceActivity={settings?.inferenceActivityEnabled === true}
                   showFleetExceptions={settings?.showFleetExceptions ?? false}
                   showOverviewSearch={settings?.showOverviewSearch ?? false}
                   showLlmTokenTotals={settings?.showLlmTokenTotals ?? true}
+                  showActivityFeed={settings?.showActivityFeed ?? true}
+                  kpis={{
+                    decode: settings?.showKpiDecode ?? true,
+                    power: settings?.showKpiPower ?? true,
+                    memory: settings?.showKpiMemory ?? true,
+                    tokens: settings?.showKpiTokens ?? true,
+                  }}
                   showVramBreakdown={settings?.showVramBreakdown ?? true}
                   temperatureUnit={settings?.temperatureUnit ?? "celsius"}
                   onSelectSpark={navigate}
@@ -590,6 +604,7 @@ function DashboardApp() {
         onAdd={() => setShowAdd(true)}
         onOpenSettings={() => setShowSettings(true)}
       />
+      <InstallPrompt />
       <CommandPalette open={showPalette} onClose={() => setShowPalette(false)} commands={paletteCommands} />
       <HermesUpdateDialog />
       <AddSparkDialog

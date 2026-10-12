@@ -12,6 +12,7 @@ import {
   PROMETHEUS_CONTENT_TYPE,
   escapeLabelValue,
   formatValue,
+  metricsEntries,
   renderPrometheusMetrics,
 } from "../prometheus.js";
 
@@ -370,6 +371,24 @@ test("multi-GPU hosts get one series per card, labelled by index", () => {
   assert.equal(samplesOf(families, "sparkdash_gpu_temperature_celsius", unit).length, 2);
 });
 
+test("unavailable GPU metrics are omitted instead of exported as zeroes", () => {
+  const unit = multiGpuHost();
+  unit.metrics.gpu.gpus[1].metricAvailability = {
+    usage: false, temperature: false, powerDraw: false, powerLimit: false, vramUsed: false, vramTotal: false,
+  };
+  unit.metrics.gpu.gpus[1].usage = 0;
+  unit.metrics.gpu.gpus[1].temperature = 0;
+  unit.metrics.gpu.gpus[1].power = { draw: 0, limit: 0 };
+  unit.metrics.gpu.gpus[1].vram = { used: 100, total: 16000, percentage: 1, available: 15900 };
+  const families = parseExposition(renderPrometheusMetrics([unit]));
+  assert.equal(samplesOf(families, "sparkdash_gpu_utilization_ratio", { gpu: "1" }).length, 0);
+  assert.equal(samplesOf(families, "sparkdash_gpu_temperature_celsius", { gpu: "1" }).length, 0);
+  assert.equal(samplesOf(families, "sparkdash_gpu_power_watts", { gpu: "1" }).length, 0);
+  assert.equal(samplesOf(families, "sparkdash_gpu_power_limit_watts", { gpu: "1" }).length, 0);
+  assert.equal(samplesOf(families, "sparkdash_gpu_memory_used_bytes", { gpu: "1" }).length, 0);
+  assert.equal(samplesOf(families, "sparkdash_gpu_memory_total_bytes", { gpu: "1" }).length, 0);
+});
+
 test("LLM endpoints: rates, counters, and nothing invented for a down or silent engine", () => {
   const families = parseExposition(renderPrometheusMetrics([gb10Head(), multiGpuHost()]));
   const tf = { unit: "spark-1", port: "8888", backend: "tensorfold", model: "GLM-5.3-Flash-EXL3" };
@@ -466,4 +485,36 @@ test("duplicate series are dropped rather than failing the scrape", () => {
   const families = parseExposition(renderPrometheusMetrics([unit, unit]));
   assert.equal(samplesOf(families, "sparkdash_up").length, 1);
   assert.equal(samplesOf(families, "sparkdash_disk_total_bytes").length, 1);
+});
+
+test("the last successful sample time of each collector is exported per unit", () => {
+  const unit = { ...gb10Head(), };
+  const text = renderPrometheusMetrics([
+    { snapshot: unit, collected: { gpu: true, cpu: true }, collectedAt: { gpu: 1_791_700_000_500, ram: 1_791_700_001_000, bad: -1, nan: NaN } },
+  ]);
+  const fam = parseExposition(text).get("sparkdash_collector_last_success_timestamp_seconds");
+  assert.equal(fam.type, "gauge");
+  const byCollector = Object.fromEntries(fam.samples.map((s) => [s.labels.collector, s.value]));
+  assert.deepEqual(byCollector, { gpu: 1_791_700_000.5, ram: 1_791_700_001 });
+  for (const sample of fam.samples) assert.equal(sample.labels.unit, "spark-1");
+});
+
+test("no collector series without a success, and none for an offline unit", () => {
+  assert.equal(parseExposition(renderPrometheusMetrics([gb10Head()])).has("sparkdash_collector_last_success_timestamp_seconds"), false);
+  const offline = parseExposition(renderPrometheusMetrics([{ snapshot: offlineUnit(), collectedAt: { gpu: 1_791_700_000_000 } }]));
+  assert.deepEqual([...offline.keys()], ["sparkdash_up"]);
+});
+
+test("metricsEntries wires each monitor's snapshot, provenance and success times into the export", () => {
+  const monitor = {
+    snapshot: () => gb10Head(),
+    _metricCollectionSuccessful: { gpu: true, cpu: true },
+    lastSuccess: () => ({ gpu: 1_791_700_000_000 }),
+  };
+  const entries = metricsEntries([monitor, undefined, null]);
+  assert.equal(entries.length, 1);
+  assert.deepEqual(entries[0].collectedAt, { gpu: 1_791_700_000_000 });
+  assert.deepEqual(entries[0].collected, { gpu: true, cpu: true });
+  const fam = parseExposition(renderPrometheusMetrics(entries)).get("sparkdash_collector_last_success_timestamp_seconds");
+  assert.equal(fam.samples[0].value, 1_791_700_000);
 });

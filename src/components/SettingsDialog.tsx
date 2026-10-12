@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { isValidTimeZone, listTimeZones } from "../shared/timeZone";
 import { fetchSettings, updateSettings } from "../api/client";
 import { clearToken, getToken, onTokenChange, requestTokenPrompt } from "../api/authToken";
 import type { Settings } from "../api/types";
@@ -104,6 +105,15 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
 
   const { mounted, visible } = useModalPresence(open);
 
+  const timeZones = useMemo(() => listTimeZones(), []);
+  const [tzTouched, setTzTouched] = useState(false);
+  const [tzFocused, setTzFocused] = useState(false);
+  const tzInput = useRef<HTMLInputElement | null>(null);
+  const browserTimeZone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
+
+  // Say a zone is unknown only once the field has been left (not while "Eur" is half typed).
+  const tzInvalid = tzTouched && !tzFocused && Boolean(settings?.timeZone) && !isValidTimeZone(settings?.timeZone);
+
   const update = (patch: Partial<Settings>) => {
     setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
     setDirty(true);
@@ -111,6 +121,11 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
 
   const handleSave = async () => {
     if (!settings) return;
+    if (settings.timeZone && !isValidTimeZone(settings.timeZone)) {
+      // The server would silently fall back to the browser's zone; say so instead.
+      setError(`"${settings.timeZone}" is not a known time zone (for example Europe/Paris), or clear the field to follow the browser.`);
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -217,6 +232,57 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
               </SettingRow>
 
               <SettingRow
+                title="Time zone"
+                help={`Hour and day boundaries and labels on the Tokens, Energy and Activity charts. Empty follows this browser (${browserTimeZone}). Daily token buckets and monthly energy totals stay UTC.`}
+                htmlFor="settings-time-zone"
+                stack
+              >
+                <div className="set-tz">
+                  <input
+                    id="settings-time-zone"
+                    type="text"
+                    list="settings-time-zones"
+                    value={settings.timeZone ?? ""}
+                    placeholder="Browser default"
+                    title={`Empty follows this browser (${browserTimeZone})`}
+                    spellCheck={false}
+                    autoComplete="off"
+                    aria-invalid={tzInvalid}
+                    aria-describedby="settings-time-zone-msg"
+                    ref={tzInput}
+                    onChange={(e) => update({ timeZone: e.target.value })}
+                    onFocus={() => setTzFocused(true)}
+                    onBlur={() => {
+                      setTzFocused(false);
+                      setTzTouched(true);
+                    }}
+                    className="field-input"
+                  />
+                  <datalist id="settings-time-zones">
+                    {timeZones.map((zone) => (
+                      <option key={zone} value={zone} />
+                    ))}
+                  </datalist>
+                  <button
+                    type="button"
+                    className="btn btn--sm btn--ghost"
+                    disabled={!settings.timeZone}
+                    onClick={() => {
+                      update({ timeZone: "" });
+                      setTzTouched(false);
+                      tzInput.current?.focus(); // the button disables itself: keep keyboard focus somewhere sensible
+                    }}
+                  >
+                    Use browser
+                  </button>
+                </div>
+                {/* One reserved line: the message appears after the field is left, and never moves anything. */}
+                <small id="settings-time-zone-msg" className="set-tz__msg" role="status" aria-live="polite">
+                  {tzInvalid ? "Unknown time zone. Try Europe/Paris." : ""}
+                </small>
+              </SettingRow>
+
+              <SettingRow
                 title="Default LLM port"
                 help="Pre-filled when adding a new Spark (1–65535)."
                 htmlFor="settings-default-llm-port"
@@ -318,6 +384,36 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 onChange={(v) => update({ showLlmTokenTotals: v })}
               />
               <ToggleRow
+                title="Show Recent activity"
+                help="Overview card with the latest health and kernel events. The full Activity page is always available from the sidebar."
+                checked={settings.showActivityFeed ?? true}
+                onChange={(v) => update({ showActivityFeed: v })}
+              />
+              <ToggleRow
+                title="Show Fleet decode tile"
+                help="Overview tile with the fleet's total generation tok/s."
+                checked={settings.showKpiDecode ?? true}
+                onChange={(v) => update({ showKpiDecode: v })}
+              />
+              <ToggleRow
+                title="Show Fleet power tile"
+                help="Overview tile with the fleet's total power draw."
+                checked={settings.showKpiPower ?? true}
+                onChange={(v) => update({ showKpiPower: v })}
+              />
+              <ToggleRow
+                title="Show Memory in use tile"
+                help="Overview tile with the fleet's total memory in use."
+                checked={settings.showKpiMemory ?? true}
+                onChange={(v) => update({ showKpiMemory: v })}
+              />
+              <ToggleRow
+                title="Show Tokens today tile"
+                help="Overview tile with the tokens generated today (or the online unit count, when no tokens are tracked yet)."
+                checked={settings.showKpiTokens ?? true}
+                onChange={(v) => update({ showKpiTokens: v })}
+              />
+              <ToggleRow
                 title="Show active fleet exceptions"
                 help="Overview strip for offline hosts, GPU throttle, disk, LLM, and Tailnet alerts. Off by default."
                 checked={Boolean(settings.showFleetExceptions)}
@@ -396,15 +492,18 @@ function SettingRow({
   title,
   help,
   htmlFor,
+  stack = false,
   children,
 }: {
   title: string;
   help?: string;
   htmlFor?: string;
+  /** Text above, control below (for controls that need room or show messages). */
+  stack?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <div className="set-row">
+    <div className={`set-row${stack ? " set-row--stack" : ""}`}>
       <div className="set-row__text">
         {htmlFor ? <label htmlFor={htmlFor}>{title}</label> : <span className="set-row__title">{title}</span>}
         {help && <small>{help}</small>}

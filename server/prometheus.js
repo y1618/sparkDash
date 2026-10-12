@@ -8,8 +8,12 @@
  * conventions people already have dashboards for: base units (bytes, seconds,
  * celsius, watts, 0–1 ratios), `_total` only on counters, one HELP and one
  * TYPE per family. Every series carries the unit's identity as labels
- * (`unit`, `unit_name`, `kind`, `role`); GPU series add `gpu` (the nvidia-smi
- * index) so multi-GPU hosts get one series per card.
+ * (`unit`, `unit_name`, `kind`, `role`); GPU series add `gpu` so multi-GPU
+ * hosts get one series per card. For an NVIDIA card `gpu` is the nvidia-smi
+ * index ("0", "1"); an AMD card is the amd-smi index plus 1000 ("1000" is the
+ * first AMD card), so the two vendors never share a label value. `name` and
+ * `uuid` on `sparkdash_gpu_info` identify the card; the 1000 offset is not a
+ * physical index.
  *
  * Unknown is not zero. The collectors return zero-filled defaults when a read
  * fails, so a sample is only written when its value was actually measured:
@@ -34,6 +38,11 @@ export const METRIC_FAMILIES = [
   },
   { name: "sparkdash_uptime_seconds", type: "gauge", help: "Host uptime from /proc/uptime." },
   {
+    name: "sparkdash_collector_last_success_timestamp_seconds",
+    type: "gauge",
+    help: "Unix time of the last poll of this collector (gpu, cpu, ram, memory, network, storage, llm, roce) that returned real data. A stuck collector stops advancing while sparkdash_up stays 1; alert on time() minus this. Absent until the first success.",
+  },
+  {
     name: "sparkdash_gpu_info",
     type: "gauge",
     help: "Always 1; carries the GPU's name and UUID as labels.",
@@ -41,7 +50,7 @@ export const METRIC_FAMILIES = [
   {
     name: "sparkdash_gpu_utilization_ratio",
     type: "gauge",
-    help: "GPU utilization reported by nvidia-smi (0-1).",
+    help: "GPU utilization reported by vendor tooling (0-1).",
   },
   {
     name: "sparkdash_gpu_temperature_celsius",
@@ -250,9 +259,9 @@ function isDefaultCpu(cpu) {
  */
 function normalizeEntry(entry) {
   if (entry && typeof entry === "object" && entry.snapshot) {
-    return { snapshot: entry.snapshot, collected: entry.collected || {} };
+    return { snapshot: entry.snapshot, collected: entry.collected || {}, collectedAt: entry.collectedAt || {} };
   }
-  return { snapshot: entry, collected: {} };
+  return { snapshot: entry, collected: {}, collectedAt: {} };
 }
 
 function addGpu(samples, base, gpu) {
@@ -270,16 +279,24 @@ function addGpu(samples, base, gpu) {
         1
       );
     }
-    if (finite(device.usage)) samples.add("sparkdash_gpu_utilization_ratio", labels, ratio(device.usage));
-    samples.add("sparkdash_gpu_temperature_celsius", labels, device.temperature);
-    samples.add("sparkdash_gpu_power_watts", labels, device.power?.draw);
-    if (finite(device.power?.limit) && device.power.limit > 0) {
+    if (device.metricAvailability?.usage !== false && finite(device.usage)) samples.add("sparkdash_gpu_utilization_ratio", labels, ratio(device.usage));
+    if (device.metricAvailability?.temperature !== false && finite(device.temperature)) {
+      samples.add("sparkdash_gpu_temperature_celsius", labels, device.temperature);
+    }
+    if (device.metricAvailability?.powerDraw !== false && finite(device.power?.draw)) {
+      samples.add("sparkdash_gpu_power_watts", labels, device.power.draw);
+    }
+    if (device.metricAvailability?.powerLimit !== false && finite(device.power?.limit) && device.power.limit > 0) {
       samples.add("sparkdash_gpu_power_limit_watts", labels, device.power.limit);
     }
     const vram = device.vram;
     if (vram && finite(vram.total) && vram.total > 0) {
-      if (finite(vram.used)) samples.add("sparkdash_gpu_memory_used_bytes", labels, bytesFromMib(vram.used));
-      samples.add("sparkdash_gpu_memory_total_bytes", labels, bytesFromMib(vram.total));
+      if (device.metricAvailability?.vramUsed !== false && finite(vram.used)) {
+        samples.add("sparkdash_gpu_memory_used_bytes", labels, bytesFromMib(vram.used));
+      }
+      if (device.metricAvailability?.vramTotal !== false) {
+        samples.add("sparkdash_gpu_memory_total_bytes", labels, bytesFromMib(vram.total));
+      }
     }
     const throttle = device.throttle;
     if (throttle && typeof throttle === "object" && throttle.reason !== "unknown") {
@@ -323,7 +340,7 @@ function addLlm(samples, base, snapshot) {
 }
 
 function addUnit(samples, entry) {
-  const { snapshot, collected } = normalizeEntry(entry);
+  const { snapshot, collected, collectedAt } = normalizeEntry(entry);
   if (!snapshot || typeof snapshot !== "object" || !snapshot.id) return;
   const base = {
     unit: snapshot.id,
@@ -335,6 +352,11 @@ function addUnit(samples, entry) {
   if (snapshot.online !== true) return;
 
   samples.add("sparkdash_uptime_seconds", base, snapshot.uptime);
+  for (const [collector, ms] of Object.entries(collectedAt)) {
+    if (finite(ms) && ms > 0) {
+      samples.add("sparkdash_collector_last_success_timestamp_seconds", { ...base, collector }, ms / 1000);
+    }
+  }
 
   const metrics = snapshot.metrics || {};
   const gpu = metrics.gpu;
@@ -399,7 +421,7 @@ function addUnit(samples, entry) {
 
 /**
  * Render the fleet as Prometheus text exposition format 0.0.4.
- * @param {Array<object | { snapshot: object, collected?: { gpu?: boolean, cpu?: boolean } }>} entries
+ * @param {Array<object | { snapshot: object, collected?: { gpu?: boolean, cpu?: boolean }, collectedAt?: Record<string, number> }>} entries
  *   unit snapshots (SparkMonitor#snapshot()), optionally wrapped with provenance
  * @returns {string}
  */
@@ -407,4 +429,20 @@ export function renderPrometheusMetrics(entries) {
   const samples = new SampleSet();
   for (const entry of entries || []) addUnit(samples, entry);
   return samples.render();
+}
+
+/**
+ * Entries for renderPrometheusMetrics from the running monitors: each unit's snapshot,
+ * which collections were real measurements, and when each collector last succeeded.
+ * @param {Iterable<any>} monitors SparkMonitor instances (null / undefined entries are skipped)
+ */
+export function metricsEntries(monitors) {
+  return [...monitors]
+    .filter(Boolean)
+    .map((monitor) => ({
+      snapshot: monitor.snapshot(),
+      // Per-domain provenance: a failed GPU/CPU read is zero-filled, not real.
+      collected: { ...monitor._metricCollectionSuccessful },
+      collectedAt: monitor.lastSuccess(),
+    }));
 }

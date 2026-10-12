@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { GpuMetrics } from "../../api/types";
 import { getGpuHistory } from "../../api/client";
 import { backfillHistory, getMetricHistorySamples, useTimedMetricsHistory } from "../../hooks/metricsStore";
@@ -69,17 +69,24 @@ function useServerBackfill(sparkId: string) {
   }, [sparkId]);
 }
 
-function useWidth(): [React.RefObject<HTMLDivElement | null>, number] {
-  const ref = useRef<HTMLDivElement | null>(null);
+/**
+ * Width of the element the returned ref is attached to, kept current with a
+ * ResizeObserver. A callback ref, because the chart's wrapper element is swapped
+ * (the "collecting history" box becomes the chart): an observer started once on the
+ * first element kept watching the removed one and the chart stayed at its first width.
+ */
+function useWidth(): [(el: HTMLDivElement | null) => void, number] {
   const [w, setW] = useState(560);
-  useEffect(() => {
-    const el = ref.current;
+  const observer = useRef<ResizeObserver | null>(null);
+  const ref = useCallback((el: HTMLDivElement | null) => {
+    observer.current?.disconnect();
+    observer.current = null;
     if (!el) return;
-    setW(Math.max(240, Math.round(el.clientWidth) || 560));
+    const measure = () => setW(Math.max(240, Math.round(el.clientWidth) || 560));
+    measure();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(() => setW(Math.max(240, Math.round(el.clientWidth) || 560)));
-    ro.observe(el);
-    return () => ro.disconnect();
+    observer.current = new ResizeObserver(measure);
+    observer.current.observe(el);
   }, []);
   return [ref, w];
 }
@@ -113,10 +120,14 @@ export function GpuHistoryChart({
   const indices = useMemo(() => (gpu?.gpus && gpu.gpus.length > 1 ? gpu.gpus.map((d) => d.index) : []), [gpu?.gpus]);
   const multi = indices.length > 1;
   const indexKey = indices.join(",");
+  const deviceLabels = new Map((gpu?.gpus ?? []).map((d) => [
+    d.index,
+    d.vendor === "amd" ? `AMD GPU ${d.physicalIndex ?? d.index}` : `GPU ${d.physicalIndex ?? d.index}`,
+  ]));
   const [viewRaw, setViewRaw] = useState<string | null>(() => readPref(VIEW_KEY));
   const [metric, setMetric] = useState<GpuMetric>(() => parseGpuMetric(readPref(METRIC_KEY)));
   const view: GpuView = multi ? parseGpuView(viewRaw, indices) : "combined";
-  const specs = useMemo(() => chartSeriesSpecs(view, metric, indices), [view, metric, indexKey]);
+  const specs = useMemo(() => chartSeriesSpecs(view, metric, indices, deviceLabels), [view, metric, indexKey, gpu?.gpus]);
 
   const lines = useMemo<Line[]>(() => {
     // The aggregate series change on every sample and on backfill, which is also when the per-card ones do.
@@ -155,7 +166,7 @@ export function GpuHistoryChart({
     setMetric(m);
     writePref(METRIC_KEY, m);
   };
-  const viewOptions: Array<[GpuView, string]> = [["combined", "Combined"], ["all", "All GPUs"], ...indices.map((i): [GpuView, string] => [i, `GPU ${i}`])];
+  const viewOptions: Array<[GpuView, string]> = [["combined", "Combined"], ["all", "All GPUs"], ...indices.map((i): [GpuView, string] => [i, deviceLabels.get(i) ?? `GPU ${i}`])];
   const controls = multi ? (
     <div className="sp-chart__controls">
       <div className="seg" role="group" aria-label="GPUs to plot">

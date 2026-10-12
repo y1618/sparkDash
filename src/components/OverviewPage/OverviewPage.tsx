@@ -6,7 +6,8 @@ import { ShutdownAll } from "../ShutdownAll";
 import { FleetEnergyCard } from "./FleetEnergyCard";
 import { FleetAlertStrip } from "./FleetAlertStrip";
 import { FleetTokenTotals } from "./FleetTokenTotals";
-import { FleetKpis } from "./FleetKpis";
+import { InferenceTrafficCard } from "./InferenceTrafficCard";
+import { FleetKpis, type KpiVisibility } from "./FleetKpis";
 import { ACTIVITY_ID, ENERGY_ID, TOKENS_ID } from "../../constants";
 import { SparkCard } from "./SparkCard";
 import { ActivityFeed } from "./ActivityFeed";
@@ -21,10 +22,16 @@ interface OverviewPageProps {
   hideOffline?: boolean;
   hideWorkers?: boolean;
   showFleetEnergy?: boolean;
+  /** Opt-in server capability; absent sources add no card or polling. */
+  showInferenceActivity?: boolean;
   showFleetExceptions?: boolean;
   showOverviewSearch?: boolean;
   /** Overview LLM token totals card (cumulative tokens per model). */
   showLlmTokenTotals?: boolean;
+  /** Recent activity card. On by default. */
+  showActivityFeed?: boolean;
+  /** Which KPI tiles are shown; a missing key means shown. */
+  kpis?: KpiVisibility;
   /** VRAM bar split by engine / system / free, judged by headroom. On by default. */
   showVramBreakdown?: boolean;
   temperatureUnit?: "celsius" | "fahrenheit";
@@ -38,9 +45,12 @@ export function OverviewPage({
   hideOffline = false,
   hideWorkers = false,
   showFleetEnergy = true,
+  showInferenceActivity = false,
   showFleetExceptions = false,
   showOverviewSearch = false,
   showLlmTokenTotals = true,
+  showActivityFeed = true,
+  kpis,
   showVramBreakdown = true,
   temperatureUnit = "celsius",
   onSelectSpark,
@@ -304,7 +314,7 @@ export function OverviewPage({
       ) : null}
 
       <div className="ov-grid">
-        <div className="ov-sparks">
+        <div className="ov-sparks" data-count={visibleSparks.length}>
           {visibleSparks.length === 0 && (
             <p className="panel ov-empty">No units match the current search and status filters.</p>
           )}
@@ -322,14 +332,19 @@ export function OverviewPage({
             );
           })}
         </div>
-        <FleetKpis sparks={visibleSparks} snapshotKey={sparks} />
+        <FleetKpis sparks={visibleSparks} snapshotKey={sparks} show={kpis} />
+        {showFleetEnergy || showLlmTokenTotals || showActivityFeed || showInferenceActivity ? (
         <div className="ov-side">
+          {showInferenceActivity ? <InferenceTrafficCard /> : null}
           {showFleetEnergy ? <FleetEnergyCard nodeCount={sparks.length} nodeNames={Object.fromEntries(sparks.map((s) => [s.id, s.name]))} onOpenDetails={onNavigate ? () => onNavigate(ENERGY_ID) : undefined} /> : null}
           {showLlmTokenTotals ? <FleetTokenTotals onOpenDetails={onNavigate ? () => onNavigate(TOKENS_ID) : undefined} /> : null}
-          <section className="panel ov-card" aria-label="Recent activity">
-            <ActivityFeed limit={6} onSelectSpark={onSelectSpark} onViewAll={onNavigate ? () => onNavigate(ACTIVITY_ID) : undefined} />
-          </section>
+          {showActivityFeed ? (
+            <section className="panel ov-card" aria-label="Recent activity">
+              <ActivityFeed limit={6} onSelectSpark={onSelectSpark} onViewAll={onNavigate ? () => onNavigate(ACTIVITY_ID) : undefined} />
+            </section>
+          ) : null}
         </div>
+        ) : null}
       </div>
     </div>
   );

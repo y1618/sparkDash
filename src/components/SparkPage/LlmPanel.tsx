@@ -429,7 +429,7 @@ export function LlmPanel({
   const uncachedPrefillTps = llm?.uncachedPrefillTps ?? 0;
   const available = llm?.available ?? false;
   // While nothing is flowing, say when the endpoint last served.
-  const idleNote = available && isLlmIdle({ generationTps, prefillTps })
+  const idleNote = available && isLlmIdle({ generationTps, prefillTps, prefillActive: llm?.prefillActive })
     ? idleLabel(llm?.lastActiveAt)
     : null;
 
@@ -561,9 +561,16 @@ export function LlmPanel({
       actions={
         <div className="sp-actions">
           {available && backend && (
-            <Tag tone="info" title={`Backend: ${backend}`}>
-              {backend} · :{llmPort}
-            </Tag>
+            <>
+              {llm?.via === "ssh-tunnel" && (
+                <Tag title="This engine's port is not reachable from the dashboard, so it is read through an SSH tunnel to the unit">
+                  via SSH
+                </Tag>
+              )}
+              <Tag tone="info" title={`Backend: ${backend}`}>
+                {backend} · :{llmPort}
+              </Tag>
+            </>
           )}
           {onRemovePort && (
             <button
@@ -623,6 +630,33 @@ export function LlmPanel({
               className="sp-input"
             />
           </label>
+          <div className="sp-btns" role="group" aria-label="Server presets">
+            <span className="eyebrow">Presets:</span>
+            <button
+              type="button"
+              title="Fill LM Studio's default port (1234)"
+              onClick={() => setPortDraft("1234")}
+              className="btn btn--sm"
+            >
+              LM Studio :1234
+            </button>
+            <button
+              type="button"
+              title="Fill Ollama's default port (11434)"
+              onClick={() => setPortDraft("11434")}
+              className="btn btn--sm"
+            >
+              Ollama :11434
+            </button>
+            <button
+              type="button"
+              title="Fill TensorFold's default port (8888)"
+              onClick={() => setPortDraft("8888")}
+              className="btn btn--sm"
+            >
+              TensorFold :8888
+            </button>
+          </div>
           <label className="sp-field">
             <span className="eyebrow">API key (optional)</span>
             <input

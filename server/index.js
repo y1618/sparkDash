@@ -40,6 +40,7 @@ import {
   normalizeQualityOptions,
 } from "./collectors/QualityBench.js";
 import { showcaseManager } from "./collectors/ShowcaseManager.js";
+import { InferenceActivityStore } from "./collectors/InferenceActivity.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
 import { onceClose, resolveLlmHttpTarget } from "./collectors/llmTunnel.js";
 import { formatLlmBaseUrl, parseLlmTargetInput } from "../src/shared/llmTarget.js";
@@ -51,7 +52,7 @@ import {
 } from "./llmtokens/LlmTokenRuntime.js";
 import { closeLlmStreamAgent } from "./collectors/LlmStreaming.js";
 import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
-import { FLEET_ENERGY_JSON_PATH } from "./config.js";
+import { FLEET_ENERGY_JSON_PATH, FLEET_ENERGY_MONTHLY_JSON_PATH } from "./config.js";
 import { FleetEnergyTracker } from "./energy/FleetEnergyTracker.js";
 import { EventLog } from "./events/EventLog.js";
 import { GpuHistory, deviceReadings } from "./metrics/GpuHistory.js";
@@ -68,7 +69,7 @@ import {
 import { testSparkConnectivity } from "./connectivity.js";
 import { TailscaleProbe } from "./collectors/TailscaleProbe.js";
 import { inspectStartupPreflight, logStartupPreflight } from "./startupPreflight.js";
-import { PROMETHEUS_CONTENT_TYPE, renderPrometheusMetrics } from "./prometheus.js";
+import { PROMETHEUS_CONTENT_TYPE, metricsEntries, renderPrometheusMetrics } from "./prometheus.js";
 
 dotenv.config();
 
@@ -287,10 +288,12 @@ function consumeBenchStartQuota(req, res) {
 
 // ─── Spark registry ──────────────────────────────────────
 const registry = new SparkRegistry();
+const inferenceActivity = new InferenceActivityStore();
 
 const fleetEnergyTracker = new FleetEnergyTracker({
   nodeIds: registry.sparkIds,
   filePath: FLEET_ENERGY_JSON_PATH,
+  monthlyFilePath: FLEET_ENERGY_MONTHLY_JSON_PATH,
 });
 
 // ─── Fleet event log ─────────────────────────────────────
@@ -314,7 +317,14 @@ function sampleGpuHistory() {
       const draw = gpu.power?.draw;
       const limit = gpu.power?.limit;
       const powerPct = Number.isFinite(draw) && Number.isFinite(limit) && limit > 0 ? Math.min(100, (draw / limit) * 100) : null;
-      gpuHistory.record(snap.id, Date.now(), gpu.usage, gpu.temperature, powerPct, deviceReadings(gpu.gpus));
+      gpuHistory.record(
+        snap.id,
+        Date.now(),
+        gpu.metricAvailability?.usage === false ? null : gpu.usage,
+        gpu.metricAvailability?.temperature === false ? null : gpu.temperature,
+        gpu.metricAvailability?.powerDraw === false || gpu.metricAvailability?.powerLimit === false ? null : powerPct,
+        deviceReadings(gpu.gpus)
+      );
     }
   } catch {
     /* sampling must never break the server */
@@ -561,6 +571,8 @@ app.post("/api/sparks/test", async (req, res) => {
       lanIp: body.lanIp || "",
       llmHost: body.llmHost,
       cx7Ip: body.cx7Ip || null,
+      platform: body.platform === "windows" ? "windows" : body.platform === "darwin" ? "darwin" : "linux",
+      kind: body.platform === "windows" ? "host" : body.kind,
       isLocal: Boolean(body.isLocal),
       role: body.role,
       workerNode: Boolean(body.workerNode),
@@ -718,7 +730,7 @@ app.put("/api/sparks/order", (req, res) => {
 
 // ─── Global settings ──────────────────────────────────────
 app.get("/api/settings", (_req, res) => {
-  res.json(getSettings());
+  res.json({ ...getSettings(), inferenceActivityEnabled: inferenceActivity.enabled });
 });
 
 app.put("/api/settings", (req, res) => {
@@ -733,10 +745,16 @@ app.put("/api/settings", (req, res) => {
       }
       restartBroadcast();
     }
-    res.json(newSettings);
+    res.json({ ...newSettings, inferenceActivityEnabled: inferenceActivity.enabled });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// Optional gateway summaries; source URLs and labels can only be set on the server.
+app.get("/api/inference/activity", async (_req, res) => {
+  await inferenceActivity.refreshIfDue();
+  res.set("Cache-Control", "no-store").json(inferenceActivity.snapshot());
 });
 
 // Recent GPU utilization / temperature / power % for one Spark (parallel arrays), newest last.
@@ -805,6 +823,11 @@ function launcherContext(req, res) {
   const spark = registry.getSpark(req.params.id);
   if (!spark) {
     res.status(404).json({ error: "Spark not found" });
+    return null;
+  }
+  if (spark.platform === "windows") {
+    // Launchers run bash start/stop scripts; not supported on Windows PCs (yet).
+    res.status(400).json({ error: "Starting and stopping models from sparkDash is not supported on Windows PCs" });
     return null;
   }
   return spark;
@@ -1963,7 +1986,8 @@ function initiateSparkShutdown(spark) {
     return spawnLocalShutdown();
   }
 
-  return sshExec(spark, SHUTDOWN_REMOTE_CMD, { timeoutMs: 8000 })
+  const shutdownCmd = spark.platform === "windows" ? "shutdown.exe /s /t 5 /c sparkDash" : SHUTDOWN_REMOTE_CMD;
+  return sshExec(spark, shutdownCmd, { timeoutMs: 8000 })
     .then(() => {
       noteShutdown();
       return "Shutdown initiated";
@@ -2141,14 +2165,7 @@ app.get("/metrics", (_req, res) => {
       .type("text")
       .send("Prometheus export is off. Enable it in Settings → Prometheus metrics.\n");
   }
-  const entries = registry.sparkIds
-    .map((id) => monitors.get(id))
-    .filter(Boolean)
-    .map((monitor) => ({
-      snapshot: monitor.snapshot(),
-      // Per-domain provenance: a failed GPU/CPU read is zero-filled, not real.
-      collected: { ...monitor._metricCollectionSuccessful },
-    }));
+  const entries = metricsEntries(registry.sparkIds.map((id) => monitors.get(id)));
   // res.end, not res.send: send() reorders the media type parameters; keep the
   // header exactly as the exposition format spells it.
   res.setHeader("Content-Type", PROMETHEUS_CONTENT_TYPE);

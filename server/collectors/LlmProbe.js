@@ -2,38 +2,51 @@
  * LlmProbe — probes an LLM server on port 8888, auto-detects backend,
  * computes live tokens/sec (generation + prefill).
  *
- * Backends: llama.cpp (native /slots), vLLM / SGLang / ds4-server
- * (OpenAI-compatible + live counters), LM Studio (OpenAI-compatible, no live
- * counters — model list only, polled slowly).
- *
  * Ported from legacy `probeLlamaServerType` and `_getLlamaMetricsFor`.
  */
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
 import { classifyHostScope } from "../validate.js";
 import { llmProbeHost } from "./llmHost.js";
+import { openSshLlmTunnel } from "./llmTunnel.js";
 
 const FAIL_RESET_THRESHOLD = 3;
+/** Direct failures in a row before the probe tries an SSH tunnel to the unit's loopback. */
+const TUNNEL_AFTER_FAILURES = 2;
+/** Failures in a row through the tunnel before it is dropped and the direct path retried. */
+const TUNNEL_DROP_AFTER_FAILURES = 5;
+const TUNNEL_RETRY_MIN_MS = 60_000;
+const TUNNEL_RETRY_MAX_MS = 15 * 60_000;
 const REDETECT_INTERVAL_MS = 60_000;
 /** Current SGLang names first. Deprecated aliases still work but log a warning per hit. */
 const SGLANG_SERVER_INFO_PATHS = ["/server_info", "/get_server_info"];
 const SGLANG_MODEL_INFO_PATHS = ["/model_info", "/get_model_info"];
+const LMSTUDIO_MODELS_PATH = "/api/v0/models";
+const LMSTUDIO_PROBE_TIMEOUT_MS = 8000;
+const OLLAMA_TAGS_PATH = "/api/tags";
+/**
+ * Fields a genuine SGLang /server_info|/get_server_info payload carries. Some
+ * servers (LM Studio) answer 200 with a JSON body on EVERY path, so "is it an
+ * object" is not enough to classify — require SGLang-shaped fields.
+ */
+const SGLANG_INFO_FIELDS = [
+  "context_length",
+  "max_total_tokens",
+  "max_req_input_len",
+  "max_total_num_tokens",
+  "max_running_requests",
+  "total_input_tokens",
+  "total_output_tokens",
+  "total_cached_tokens",
+  "model_path",
+  "tokenizer_path",
+  "load_format",
+];
 /**
  * SGLang's last_gen_throughput is a sticky gauge (holds last decode rate when
  * idle). Only treat it as live after we observe a change between polls, and
  * expire back to 0 if it stops changing.
  */
 const SGLANG_STICKY_TPS_LIVE_MS = 6_000;
-/**
- * LM Studio exposes no live token counters (no /metrics, /slots, /get_server_info)
- * and answers *every* unknown path with HTTP 200 + {"error": ...}, logging each
- * hit as an ERROR in its Developer Logs. Once detected, read only its model list,
- * and only this often — there is nothing live to pick up between polls.
- */
-const LMSTUDIO_POLL_INTERVAL_MS = 10_000;
-/** `owned_by` that LM Studio's /v1/models reports for every model. */
-const LMSTUDIO_OWNED_BY = "organization_owner";
-/** Keys of a bare error envelope ({"error": "..."}) — not server info. */
-const ERROR_ENVELOPE_KEYS = new Set(["error", "message", "detail", "code", "status"]);
 
 /**
  * Prefer a short model id when the server returns a Hugging Face hub cache path.
@@ -78,10 +91,19 @@ export class LlmProbe {
   constructor(spark, port = 8888) {
     this.spark = spark;
     this.port = port;
-    this.baseUrl = `http://${llmProbeHost(spark)}:${port}`;
+    /** The unit's own address; baseUrl switches to a local forward when only SSH reaches the engine. */
+    this._directBase = `http://${llmProbeHost(spark)}:${port}`;
+    this.baseUrl = this._directBase;
+    /** @type {{ port: number, close: () => void } | null} */
+    this._tunnel = null;
+    this._tunnelRetryAt = 0;
+    this._tunnelBackoffMs = TUNNEL_RETRY_MIN_MS;
+    this._tunnelOpening = false;
+    /** Replaceable in tests. */
+    this._openTunnel = openSshLlmTunnel;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | 'lmstudio' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'lmstudio' | 'ollama' | 'ds4' | 'exl3' | 'q27' | 'tensorfold' | 'freetoken' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -108,6 +130,7 @@ export class LlmProbe {
     this._tensorfoldSeeded = false;
     /** Previous TensorFold `prefill_seconds_total`. null until a sample includes it. */
     this._tensorfoldPrefillSeconds = null;
+    this._tensorfoldPrevCached = null;
     this._tensorfoldLastPrefill = null;
     this.prefillActive = false;
     /** Previous prefill counters by kind; null until first labeled sample. */
@@ -163,8 +186,6 @@ export class LlmProbe {
     this._lastDetectAt = 0;
     /** @type {{ value: number, liveUntil: number } | null} */
     this._sglangStickyTps = null;
-    /** Last successful LM Studio model-list read (ms). 0 = never / reset. */
-    this._lmStudioLastOkAt = 0;
     /** Latest gen_throughput from /v1/loads, if that payload carried one. */
     this._sglangLoadGenTps = null;
     /** Whether this poll's /server_info carried total_input/output_tokens. */
@@ -225,12 +246,16 @@ export class LlmProbe {
   /** Update probe port (and host from spark). Resets detection when the target changes. */
   setPort(port) {
     const next = Number(port);
-    const prevUrl = this.baseUrl;
+    const prevUrl = this._directBase;
     if (Number.isInteger(next) && next >= 1 && next <= 65535) {
       this.port = next;
     }
-    this.baseUrl = `http://${llmProbeHost(this.spark)}:${this.port}`;
-    if (this.baseUrl !== prevUrl) {
+    this._directBase = `http://${llmProbeHost(this.spark)}:${this.port}`;
+    if (this._directBase !== prevUrl) {
+      this._closeTunnel();
+      this._tunnelRetryAt = 0;
+      this._tunnelBackoffMs = TUNNEL_RETRY_MIN_MS;
+      this.baseUrl = this._directBase;
       this._resetDetection();
       this._lastDetectAt = 0;
       this._consecutiveFailures = 0;
@@ -239,6 +264,15 @@ export class LlmProbe {
 
   /** Probe the LLM server and return a snapshot. */
   async probe() {
+    const snap = await this._probeOnce();
+    // Only SSH may reach the engine (its port is not exposed): after repeated direct
+    // failures, forward a local port through the unit's SSH login and probe that.
+    if (!snap.available && (await this._maybeOpenTunnel())) return this._probeOnce();
+    this._maybeDropTunnel();
+    return snap;
+  }
+
+  async _probeOnce() {
     try {
       const shouldDetect =
         this.serverIsOpenAI === null ||
@@ -254,10 +288,7 @@ export class LlmProbe {
         this._noteSuccess();
         return snap;
       } else if (this.serverIsOpenAI === true) {
-        const snap =
-          this.backendType === "lmstudio"
-            ? await this._probeLmStudio()
-            : await this._probeOpenAICompatible();
+        const snap = await this._probeOpenAICompatible();
         this._noteSuccess();
         return snap;
       } else {
@@ -270,8 +301,76 @@ export class LlmProbe {
     }
   }
 
+  /** True when this unit can be reached over SSH but the engine's own address may not be. */
+  _canTunnel() {
+    const spark = this.spark;
+    return Boolean(
+      spark &&
+        !spark.isLocal &&
+        !spark.llmHost && // a pinned llmHost is a different machine: never tunnel to the SSH host's loopback
+        spark.platform !== "windows" &&
+        spark.ssh?.host &&
+        !this._tunnel &&
+        !this._tunnelOpening
+    );
+  }
+
+  async _maybeOpenTunnel() {
+    if (this._consecutiveFailures < TUNNEL_AFTER_FAILURES) return false;
+    if (!this._canTunnel() || Date.now() < this._tunnelRetryAt) return false;
+    this._tunnelOpening = true;
+    try {
+      const tunnel = await this._openTunnel(this.spark, this.port);
+      this._tunnel = tunnel;
+      this.baseUrl = `http://127.0.0.1:${tunnel.port}`;
+      this._resetDetection();
+      this._lastDetectAt = 0;
+      this._consecutiveFailures = 0;
+      return true;
+    } catch {
+      this._scheduleTunnelRetry();
+      return false;
+    } finally {
+      this._tunnelOpening = false;
+    }
+  }
+
+  /** Through the tunnel and still failing (engine down, or the tunnel died): fall back to direct. */
+  _maybeDropTunnel() {
+    if (this._tunnel && this._consecutiveFailures >= TUNNEL_DROP_AFTER_FAILURES) {
+      this._closeTunnel();
+      this._scheduleTunnelRetry();
+      this.baseUrl = this._directBase;
+      this._resetDetection();
+      this._lastDetectAt = 0;
+      this._consecutiveFailures = 0;
+    }
+  }
+
+  _scheduleTunnelRetry() {
+    this._tunnelRetryAt = Date.now() + this._tunnelBackoffMs;
+    this._tunnelBackoffMs = Math.min(this._tunnelBackoffMs * 2, TUNNEL_RETRY_MAX_MS);
+  }
+
+  _closeTunnel() {
+    const tunnel = this._tunnel;
+    this._tunnel = null;
+    try {
+      tunnel?.close();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Release the SSH forward (monitor stopped, port removed). */
+  dispose() {
+    this._closeTunnel();
+    this.baseUrl = this._directBase;
+  }
+
   _noteSuccess() {
     this._consecutiveFailures = 0;
+    if (this._tunnel) this._tunnelBackoffMs = TUNNEL_RETRY_MIN_MS;
     this.error = null;
   }
 
@@ -317,6 +416,7 @@ export class LlmProbe {
     this.lastTokenCounts = { input: 0, output: 0 };
     this._tensorfoldSeeded = false;
     this._tensorfoldPrefillSeconds = null;
+    this._tensorfoldPrevCached = null;
     this._tensorfoldLastPrefill = null;
     this.prefillActive = false;
     this.lastPrefillKinds = null;
@@ -324,7 +424,6 @@ export class LlmProbe {
     this.lastTtftCount = null;
     this.lastIterSum = null;
     this._sglangStickyTps = null;
-    this._lmStudioLastOkAt = 0;
     this._sglangLoadGenTps = null;
   }
 
@@ -344,20 +443,20 @@ export class LlmProbe {
   // ─── Server type detection ───────────────────────────────
   async _detectServerType() {
     // Skip the llama.cpp /slots probe once we've positively identified an
-    // OpenAI-compatible backend. vLLM / sglang / ds4-server / LM Studio have
-    // no /slots, so re-probing it on every re-detect cycle just spams 404s
-    // (or, for LM Studio, ERROR log lines) in the backend's log (#15). Still
-    // probe /slots on first contact, when the type is unknown, or when the
-    // backend was previously llama.cpp.
+    // OpenAI-compatible backend. vLLM / sglang / ds4-server have no /slots,
+    // so re-probing it on every re-detect cycle just spams 404s in the
+    // backend's access log (#15). Still probe /slots on first contact, when
+    // the type is unknown, or when the backend was previously llama.cpp.
     if (
       this.backendType !== "vllm" &&
       this.backendType !== "sglang" &&
+      this.backendType !== "lmstudio" &&
+      this.backendType !== "ollama" &&
       this.backendType !== "ds4" &&
       this.backendType !== "exl3" &&
       this.backendType !== "q27" &&
       this.backendType !== "tensorfold" &&
-      this.backendType !== "freetoken" &&
-      this.backendType !== "lmstudio"
+      this.backendType !== "freetoken"
     ) {
       const slotUrl = `${this.baseUrl}/slots`;
       try {
@@ -405,16 +504,18 @@ export class LlmProbe {
   }
 
   /**
-   * Classify an OpenAI-compatible server: LM Studio, ds4, SGLang, EXL3, q27,
-   * TensorFold, FreeToken, or vLLM (default). LM Studio is decided from
-   * `owned_by` alone — it answers 200 to any path, so the network probes would
-   * misfire on it (and every probe lands in its error log).
+   * Classify an OpenAI-compatible server: LM Studio, Ollama, ds4, SGLang,
+   * EXL3, q27, TensorFold, FreeToken, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"lmstudio" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "vllm">}
+   * @returns {Promise<"lmstudio" | "ollama" | "ds4" | "sglang" | "exl3" | "q27" | "tensorfold" | "freetoken" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
+    // LM Studio first: it answers 200 + JSON on every path, so the heuristic
+    // probes below (notably SGLang's /server_info) would misfire on it.
+    if (await this._probeIsLmStudio()) return "lmstudio";
+    // Ollama second: its native /api/tags contract is unique among engines.
+    if (await this._probeIsOllama()) return "ollama";
     if (typeof ownedBy === "string") {
-      if (LlmProbe._isLmStudioOwner(ownedBy)) return "lmstudio";
       if (/ds4/i.test(ownedBy)) return "ds4";
       if (/sglang/i.test(ownedBy)) return "sglang";
       if (/exl3/i.test(ownedBy)) return "exl3";
@@ -424,6 +525,8 @@ export class LlmProbe {
       if (/tensorfold/i.test(ownedBy)) return "tensorfold";
       // FreeToken reports owned_by: "FreeToken".
       if (/freetoken/i.test(ownedBy)) return "freetoken";
+      // Ollama's OpenAI-compat /v1/models may report its own name.
+      if (/^ollama$/i.test(ownedBy)) return "ollama";
     }
     if (await this._probeIsDs4()) return "ds4";
     if (await this._probeIsSglang()) return "sglang";
@@ -431,13 +534,6 @@ export class LlmProbe {
     if (await this._probeIsQ27()) return "q27";
     if (await this._probeIsFreeToken()) return "freetoken";
     return "vllm";
-  }
-
-  /** @param {unknown} ownedBy */
-  static _isLmStudioOwner(ownedBy) {
-    return (
-      typeof ownedBy === "string" && ownedBy.trim().toLowerCase() === LMSTUDIO_OWNED_BY
-    );
   }
 
   /**
@@ -504,7 +600,7 @@ export class LlmProbe {
         const res = await this._fetch(`${this.baseUrl}${path}`);
         if (!res.ok) continue;
         const data = await res.json().catch(() => null);
-        if (LlmProbe._looksLikeServerInfo(data)) return data;
+        if (data && typeof data === "object" && !Array.isArray(data)) return data;
       } catch {
         /* try next */
       }
@@ -514,20 +610,52 @@ export class LlmProbe {
 
   /** True when SGLang native server-info endpoints respond. */
   async _probeIsSglang() {
-    return (await this._fetchSglangJson(SGLANG_SERVER_INFO_PATHS)) != null;
+    const sgData = await this._fetchSglangJson(SGLANG_SERVER_INFO_PATHS);
+    if (sgData == null) return false;
+    // Some catch-all servers (LM Studio) answer 200 + {"error": ...} on every
+    // path. A real SGLang server-info payload carries SGLang-shaped fields.
+    return SGLANG_INFO_FIELDS.some((f) => f in sgData);
   }
 
   /**
-   * True for a JSON object that carries real server info — not a bare error
-   * envelope. Some servers (LM Studio) answer unknown paths with
-   * 200 + {"error": "..."}; that must not read as "SGLang answered".
-   * @param {unknown} data
+   * True when `/api/v0/models` matches LM Studio's REST contract — model
+   * entries with a load `state` (plus publisher/arch/quantization metadata).
+   * No other OpenAI-compatible server exposes this shape.
    */
-  static _looksLikeServerInfo(data) {
-    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
-    const keys = Object.keys(data);
-    if (!keys.length) return false;
-    return keys.some((k) => !ERROR_ENVELOPE_KEYS.has(k));
+  async _probeIsLmStudio() {
+    // LM Studio is a single-threaded server on the probed machine; while it is busy
+    // (generating) responses can exceed the normal probe timeout, and a miss silently
+    // downgrades the backend label to "vllm", so detection gets a longer budget. One
+    // attempt only: a port that hangs on this path must not stall the poll for twice that.
+    try {
+      const res = await this._fetch(`${this.baseUrl}${LMSTUDIO_MODELS_PATH}`, LMSTUDIO_PROBE_TIMEOUT_MS);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      if (!data || typeof data !== "object" || !Array.isArray(data.data) || data.data.length === 0) {
+        return false;
+      }
+      return data.data.every((m) => m && typeof m === "object" && typeof m.id === "string" && "state" in m);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * True when `/api/tags` matches Ollama's native contract — a top-level
+   * `models` array (even empty). No other engine serves this shape; Ollama
+   * 404s unknown paths so the catch-all hazards don't apply, but without a
+   * positive probe it would fall through to the "vllm" default label.
+   */
+  async _probeIsOllama() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}${OLLAMA_TAGS_PATH}`);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      if (!data || typeof data !== "object" || !Array.isArray(data.models)) return false;
+      return data.models.every((m) => m == null || typeof m === "object");
+    } catch {
+      return false;
+    }
   }
 
   /** True when Prometheus /metrics exposes ds4-server series (ds4-on-spark). */
@@ -690,7 +818,9 @@ export class LlmProbe {
     if (this.backendType === "sglang" || this.backendType == null) {
       this._sglangTotalsPolled = false;
       const sgData = await this._fetchSglangJson(SGLANG_SERVER_INFO_PATHS);
-      if (sgData) {
+      // Catch-all servers (LM Studio) answer 200 + {"error": …} on every path;
+      // only latch sglang when the payload actually looks like SGLang.
+      if (sgData && SGLANG_INFO_FIELDS.some((f) => f in sgData)) {
         this.backendType = "sglang";
         // Load before last_gen_throughput so inflight can keep a steady rate live.
         await this._probeSglangLoad();
@@ -728,41 +858,59 @@ export class LlmProbe {
       return this._getSnapshot();
     }
 
-    // Single /metrics fetch: ds4-server or vLLM Prometheus exposition
-    try {
-      const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
-      if (metricsRes.ok) {
-        const txt = await metricsRes.text();
-        if (
-          this.backendType === "ds4" ||
-          LlmProbe._metricsLookLikeDs4(txt)
-        ) {
-          this.backendType = "ds4";
-          this._applyDs4Metrics(txt, dtSec);
+    // Single /metrics fetch: ds4-server or vLLM Prometheus exposition.
+    // Skip it for backends that never serve Prometheus — LM Studio answers
+    // 200 + JSON on every path, and each fetch just spams its access log.
+    const wantsPrometheus =
+      this.backendType == null ||
+      this.backendType === "vllm" ||
+      this.backendType === "ds4" ||
+      this.backendType === "q27" ||
+      this.backendType === "sglang";
+    if (wantsPrometheus) {
+      try {
+        const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+        if (metricsRes.ok) {
+          const txt = await metricsRes.text();
+          if (
+            this.backendType === "ds4" ||
+            LlmProbe._metricsLookLikeDs4(txt)
+          ) {
+            this.backendType = "ds4";
+            this._applyDs4Metrics(txt, dtSec);
+          } else if (
+            this.backendType === "q27" ||
+            LlmProbe._metricsLookLikeQ27(txt)
+          ) {
+            this.backendType = "q27";
+            this._applyQ27Metrics(txt, dtSec);
+          } else {
+            // Only claim vLLM when the backend is still unclassified — a
+            // positively-identified backend (LM Studio, tensorfold, …) must not
+            // be downgraded just because its /metrics body isn't Prometheus text
+            // (LM Studio answers 200 + JSON on every path).
+            if (this.backendType == null || this.backendType === "vllm") {
+              this.backendType = "vllm";
+              this._applyVllmMetrics(txt, dtSec);
+            }
+          }
         } else if (
-          this.backendType === "q27" ||
-          LlmProbe._metricsLookLikeQ27(txt)
+          (this.backendType == null || this.backendType === "vllm") &&
+          this.backendType !== "ds4" &&
+          this.backendType !== "exl3" &&
+          this.backendType !== "q27"
         ) {
-          this.backendType = "q27";
-          this._applyQ27Metrics(txt, dtSec);
-        } else {
           this.backendType = "vllm";
-          this._applyVllmMetrics(txt, dtSec);
         }
-      } else if (
-        this.backendType !== "ds4" &&
-        this.backendType !== "exl3" &&
-        this.backendType !== "q27"
-      ) {
-        this.backendType = "vllm";
-      }
-    } catch {
-      if (
-        this.backendType !== "ds4" &&
-        this.backendType !== "exl3" &&
-        this.backendType !== "q27"
-      ) {
-        this.backendType = "vllm";
+      } catch {
+        if (
+          (this.backendType == null || this.backendType === "vllm") &&
+          this.backendType !== "ds4" &&
+          this.backendType !== "exl3" &&
+          this.backendType !== "q27"
+        ) {
+          this.backendType = "vllm";
+        }
       }
     }
 
@@ -1160,11 +1308,13 @@ export class LlmProbe {
     }
     const prevIn = this.lastTokenCounts.input;
     const prevPrefillSec = this._tensorfoldPrefillSeconds;
+    const prevCached = this._tensorfoldPrevCached ?? null;
     this._applyExl3Health(health, dtSec);
     // TensorFold 0.5.0 (cuda/health.py) publishes cumulative cached prompt tokens
     // alongside the EXL3-style counters; older builds omit it (stays null).
-    const cached = Number(health.cached_tokens_total);
+    const cached = health.cached_tokens_total == null ? NaN : Number(health.cached_tokens_total);
     if (Number.isFinite(cached) && cached >= 0) this.totalCachedTokens = cached;
+    this._tensorfoldPrevCached = Number.isFinite(cached) && cached >= 0 ? cached : null;
     const batch = Number(health.max_batch_size);
     if (Number.isFinite(batch) && batch > 0) this.slotsTotal = Math.round(batch);
     // TensorFold 0.6.0 CUDA serves several streams at once: `streams.max` is the
@@ -1208,11 +1358,18 @@ export class LlmProbe {
     if (!(dtSec > 0 && dtSec < 10)) return;
     const dSec = prefillSec - prevPrefillSec;
     const dIn = prompt - prevIn;
-    if (dSec > 0 && dIn > 0) {
+    // `prompt_tokens_total` counts every prompt token, including those served from the prefix
+    // cache (an agent re-sending a growing 50k-token conversation is ~95% cache hits), while
+    // `prefill_seconds_total` is only the time spent computing. Dividing one by the other gave
+    // 100k+ tok/s. Use computed (uncached) tokens when the build reports the cached total.
+    const dCached =
+      Number.isFinite(cached) && prevCached != null ? Math.max(0, cached - prevCached) : null;
+    const dComputed = dCached == null ? dIn : Math.max(0, dIn - dCached);
+    if (dSec > 0 && dComputed > 0) {
       // A request just finished: its average prefill rate. TensorFold publishes token and time
       // totals only for finished requests, so nothing is measurable while a long prefill runs;
       // keep the last finished rate on screen for a while instead of flashing to 0.
-      this._tensorfoldLastPrefill = { tps: Math.max(0, Math.round((dIn / dSec) * 100) / 100), at: Date.now() };
+      this._tensorfoldLastPrefill = { tps: Math.max(0, Math.round((dComputed / dSec) * 100) / 100), at: Date.now() };
       this.prefillTps = this._tensorfoldLastPrefill.tps;
     } else if (this._tensorfoldLastPrefill && Date.now() - this._tensorfoldLastPrefill.at < 20_000) {
       this.prefillTps = this._tensorfoldLastPrefill.tps;
@@ -1839,81 +1996,6 @@ export class LlmProbe {
     }
   }
 
-  // ─── LM Studio path ───────────────────────────────────────
-  /**
-   * LM Studio: OpenAI-compatible, but with no live counters anywhere, and it
-   * answers every unknown path with 200 + {"error"} and logs it as an ERROR.
-   * So: never touch /slots, /metrics, /get_server_info, /get_model_info here.
-   * Read the loaded model + context from its native REST list (/api/v0/models,
-   * falling back to /v1/models) at most once per LMSTUDIO_POLL_INTERVAL_MS and
-   * re-serve the last snapshot in between. Live tok/s stays 0 by design — the
-   * decode bench / showcase measure client-side.
-   */
-  async _probeLmStudio() {
-    const now = Date.now();
-    if (this._lmStudioLastOkAt && now - this._lmStudioLastOkAt < LMSTUDIO_POLL_INTERVAL_MS) {
-      return this._getSnapshot();
-    }
-    this.lastProbeTime = now;
-
-    let applied = false;
-    try {
-      const res = await this._fetch(`${this.baseUrl}/api/v0/models`);
-      const auth = this._noteAuthStatus(res.status);
-      if (auth === "auth") return this._getSnapshot();
-      if (auth === "ok") {
-        const data = await res.json().catch(() => null);
-        const list = Array.isArray(data?.data) ? data.data : null;
-        // Shape check: the native list carries `state`; a 200 error envelope doesn't.
-        if (list && list.some((m) => m && typeof m === "object" && "state" in m)) {
-          this._applyLmStudioModels(list);
-          applied = true;
-        }
-      }
-    } catch {
-      /* fall back to the OpenAI list */
-    }
-
-    if (!applied) {
-      const res = await this._fetch(`${this.baseUrl}/v1/models`);
-      const auth = this._noteAuthStatus(res.status);
-      if (auth === "auth") return this._getSnapshot();
-      if (auth !== "ok") throw new Error("LM Studio /v1/models unreachable");
-      const data = await res.json();
-      const model = data?.data?.[0];
-      this.modelId = normalizeModelId(model?.id || null);
-      this.modelPath = null;
-    }
-
-    // No live counters on this backend — never show a stale rate.
-    this.generationTps = 0;
-    this.prefillTps = 0;
-    this._lmStudioLastOkAt = Date.now();
-    return this._getSnapshot();
-  }
-
-  /**
-   * Pick the model to show from LM Studio's native list: the first *loaded*
-   * LLM/VLM (what a request would hit), else the first LLM (JIT-loadable) so
-   * the bench / showcase still have a model id to send. Embedding models are
-   * never picked.
-   * @param {Array<Record<string, unknown>>} list
-   */
-  _applyLmStudioModels(list) {
-    const isLlm = (m) => m?.type == null || m.type === "llm" || m.type === "vlm";
-    const loaded = list.filter((m) => m && m.state === "loaded" && isLlm(m));
-    const pick = loaded[0] ?? list.find((m) => m && isLlm(m)) ?? null;
-    this.modelId = normalizeModelId(pick?.id || null);
-    this.modelPath = null;
-    this.contextLength =
-      LlmProbe._positiveNumber(pick?.loaded_context_length) ??
-      LlmProbe._positiveNumber(pick?.max_context_length) ??
-      null;
-    // Running / queued request counts are not exposed by LM Studio.
-    this.slotsActive = 0;
-    this.slotsTotal = 0;
-  }
-
   // ─── llama.cpp native path ────────────────────────────────
   async _probeLlamaCpp() {
     this._clearEngineMemory();
@@ -2290,7 +2372,9 @@ export class LlmProbe {
   _getSnapshot() {
     const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
+      port: this.port,
       available: metricsLive,
+      via: this._tunnel ? "ssh-tunnel" : "direct",
       backend: this.backendType,
       modelId: this.models.length > 1 ? this.models[0] : this.modelId || null,
       modelPath: this.modelPath || null,
@@ -2330,6 +2414,7 @@ export class LlmProbe {
 
   _defaultLlm() {
     return {
+      port: this.port,
       available: false,
       backend: this.backendType,
       modelId: null,
@@ -2375,10 +2460,10 @@ export class LlmProbe {
     return key || null;
   }
 
-  async _fetch(url) {
-    const headers = {};
+  async _fetch(url, timeoutMs = LLM_PROBE_TIMEOUT_MS, init = {}) {
+    const headers = { ...init.headers };
     const apiKey = this._apiKey();
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS), headers });
+    return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs), headers });
   }
 }

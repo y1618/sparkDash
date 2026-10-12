@@ -3,6 +3,7 @@
  * Prometheus text — never the SPA fallback's index.html / "Frontend not built".
  */
 import assert from "node:assert/strict";
+import { isolatedConfigEnv } from "./isolatedEnv.js";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -30,6 +31,7 @@ test("GET /metrics answers 404 while off and Prometheus text once enabled", asyn
     cwd: path.resolve(import.meta.dirname, "../.."),
     env: {
       ...process.env,
+      ...isolatedConfigEnv(tmp),
       BIND_HOST: "127.0.0.1",
       PORT: String(port),
       SPARKDASH_TOKEN: "",
@@ -40,6 +42,7 @@ test("GET /metrics answers 404 while off and Prometheus text once enabled", asyn
       LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       LLM_TOKEN_JSON_PATH: path.join(tmp, "llm-token-totals.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
+      FLEET_ENERGY_MONTHLY_JSON_PATH: path.join(tmp, "fleet-energy-monthly.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

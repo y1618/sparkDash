@@ -2,11 +2,13 @@ import type {
   ActivityEvent,
   ActivityEventsPage,
   EnergyHistory,
+  MonthlyEnergy,
   TokenHistory,
   DecodeBenchJob,
   DecodeBenchListResponse,
   FleetEnergy,
   HealthResponse,
+  InferenceActivity,
   HermesBatchUpdateResponse,
   HermesUpdatesResponse,
   LauncherAction,
@@ -63,6 +65,11 @@ export function fetchSparks(): Promise<{ sparks: SparkConfig[] }> {
 
 export function fetchFleetEnergy(): Promise<FleetEnergy> {
   return apiFetch("/api/fleet-energy");
+}
+
+/** Optional, sanitized inference request activity from a configured private source. */
+export function fetchInferenceActivity(): Promise<InferenceActivity> {
+  return apiFetch("/api/inference/activity");
 }
 
 /** Fleet activity log, newest first. */
@@ -130,6 +137,11 @@ export function fetchTokenHistory(): Promise<TokenHistory> {
 /** Hourly fleet energy for up to 31 days, per node. */
 export function fetchEnergyHistory(): Promise<EnergyHistory> {
   return apiFetch("/api/fleet-energy/history");
+}
+
+/** Permanent per-month fleet energy (survives resets, restarts and fleet changes). */
+export function fetchMonthlyEnergy(): Promise<MonthlyEnergy> {
+  return apiFetch("/api/fleet-energy/monthly");
 }
 
 /** Latest metrics snapshot for one Spark (includes per-port LLM modelId). */
@@ -744,8 +756,9 @@ export function cancelToolEvalWatch(sparkId: string): Promise<{ success: boolean
 /** Recent GPU history kept by the server (parallel arrays, oldest first; `p` is null where power was unknown). */
 export interface GpuHistoryResponse {
   t: number[];
-  u: number[];
-  c: number[];
+  /** Null where usage / temperature was unknown (e.g. a vendor tool reported no value). */
+  u: Array<number | null>;
+  c: Array<number | null>;
   p: Array<number | null>;
   /** Per-card series of a multi-GPU host, parallel to `t` (null where the card had no reading). Absent on older servers. */
   gpus?: Array<{ index: number; name: string | null; u: Array<number | null>; c: Array<number | null>; p: Array<number | null> }>;
