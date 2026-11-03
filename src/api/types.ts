@@ -288,8 +288,12 @@ export interface GpuMetrics {
   processes?: Array<{ pid: number; name: string; vramMB: number }>;
   /** NVIDIA clock throttle / thermal slowdown state from nvidia-smi. */
   throttle?: GpuThrottle | null;
-  /** Kernel NVRM NV_ERR_NO_MEMORY count since boot (cached ~60s). */
-  nvErrNoMemory?: number;
+  /**
+   * Kernel NVRM NV_ERR_NO_MEMORY count since boot (cached ~60s). null while the since-boot
+   * baseline is still being read a page at a time, or when the journal is unreadable: the
+   * count is unknown then, not zero.
+   */
+  nvErrNoMemory?: number | null;
   /** Kernel Xid errors and OOM-killer kills since boot (cached ~60s). null when the journal is unreadable. */
   kernelErrors?: { xid: number; oomKills: number; lastXid: string | null } | null;
   /**
@@ -407,6 +411,9 @@ export interface RoceDevice {
   speedMbps: number | null;
   rxBps: number | null;
   txBps: number | null;
+  /** RDMA payload throughput from the port's port_rcv_data / port_xmit_data counters, bytes/s. */
+  rdmaRxBps: number | null;
+  rdmaTxBps: number | null;
   rxErrors: number | null;
   txErrors: number | null;
   rxDropped: number | null;
@@ -457,6 +464,8 @@ export interface LlmMetrics {
   via?: "direct" | "ssh-tunnel";
   modelId: string | null;
   modelPath: string | null;
+  /** Engine version from vLLM's GET /version; null when the backend reports none or it could not be read. */
+  engineVersion?: string | null;
   /** Exact served request IDs from /v1/models, in response order. */
   models?: string[];
   contextLength: number | null;
@@ -475,13 +484,13 @@ export interface LlmMetrics {
    */
   perStreamTps?: number | null;
   /**
-   * Effective prefill tok/s of ONE request (aggregate equals it on engines
-   * without a per-request split). Derived from prompt-token and prefill-second
-   * counters that advance when a request FINISHES, so it is held between
-   * completions. Prompt counters include prefix-cache hits — treat it as an
-   * effective rate, not raw GPU compute speed; null when unavailable.
+   * Prefill rate over completed requests, held for up to 20 seconds.
+   * This effective rate includes cache credit; see prefillTpsSource.
+   * Not continuously measured live or an individual-request rate.
    */
   perStreamPrefillTps?: number | null;
+  /** TensorFold: live throughput or a held, cache-inclusive completed-request window. */
+  prefillTpsSource?: "live" | "completed-effective" | "completed-split" | null;
   prefillTps: number;
   /** A prompt is being processed right now. With no live rate available (TensorFold reports totals only for finished requests) the UI says "prefilling" instead of 0. */
   prefillActive?: boolean;
@@ -688,6 +697,16 @@ export interface SparkMetrics {
 }
 
 // ─── Spark snapshot (server pushes this) ──────────────────
+/** Hint attached to a head whose engine answers on a paired worker (#271). */
+export interface LlmMovedToWorker {
+  workerId: string;
+  workerName: string;
+  port: number;
+  modelId: string | null;
+  backend: string | null;
+  message: string;
+}
+
 export interface SparkSnapshot {
   id: string;
   /** Active health findings, most important first is not guaranteed; sort with sortFindings. */
@@ -722,6 +741,11 @@ export interface SparkSnapshot {
   workerDerivedLabel?: string | null;
   /** Optional head Spark id when role is worker */
   workerHeadId?: string | null;
+  /**
+   * Head only: the engine answers on a paired worker while every head port is down (#271).
+   * Display-only hint — sparkDash never swaps roles itself.
+   */
+  llmMovedTo?: LlmMovedToWorker | null;
   /** Standalone: whether LLM is probed (head always true, worker always false) */
   llmMonitoring?: boolean;
   /** LLM server port (first port, for backward compat) */
@@ -892,6 +916,8 @@ export interface HealthResponse {
   authMode: AuthMode;
   errors: string[];
   warnings: string[];
+  /** The running server's package version; absent on servers that predate the field. */
+  version?: string | null;
 }
 
 export interface InferenceActivity {
@@ -981,6 +1007,12 @@ export interface Settings {
    * Missing or out of range becomes 12 hours.
    */
   occupancyMaxAgeMs: number;
+  /**
+   * GPU temperature (°C) at which the Health finding warns, and at which it turns
+   * critical. Defaults 85 and 90; warn is always below critical. Alerts reuse the finding.
+   */
+  healthTempWarnC: number;
+  healthTempCriticalC: number;
 }
 
 export type OccupancyBadge = "unknown" | "generating" | "stalled";
@@ -1058,6 +1090,8 @@ export type HistoryUnitSeries =
   | "gpuPower"
   | "memUsedMB"
   | "memFreeMB"
+  | "memGpuMB"
+  | "memSysMB"
   | "cpuUtil"
   | "cpuTemp"
   | "ramUsedMB"
@@ -1129,8 +1163,12 @@ export interface DecodeBenchConfig {
   promptType?: DecodeBenchPromptType;
   /** Sampling temperature (default 0.7). Older runs have none: they ran at 0. */
   temperature?: number;
+  /** Sent only for a detected TensorFold backend; absent means no top_k override. */
+  topK?: number;
   /** Thinking on (default). Older runs have none: they ran with it off. */
   thinking?: boolean;
+  /** Prompt tokens each stream carries before it decodes (deep-context start). Absent: empty context. */
+  contextTokens?: number;
   /** On-demand remote host (Tailscale HTTPS, etc.). */
   host?: string;
   tls?: boolean;
@@ -1148,6 +1186,10 @@ export interface DecodeBenchStreamResult {
   completionTokens: number;
   prefillTps: number;
   prefillTokens: number;
+  /** Prompt tokens the server served from its prefix cache. */
+  cachedTokens?: number;
+  /** Deep-context runs: did this stream decode from the prefilled KV? */
+  contextCache?: "cached" | "partial" | "uncached" | "unknown";
   totalMs: number;
   error: string | null;
   /** Exact prompt used for this stream (debug). */
@@ -1205,6 +1247,12 @@ export interface DecodeBenchLevelResult {
   totalCompletionTokens: number;
   durationMs: number;
   error: string | null;
+  /** Deep-context runs: the prefix cache did not serve every stream's context, so tok/s is not clean. */
+  warning?: string;
+  /** Deep-context runs: prompt tokens per stream and the time spent prefilling them before the wave. */
+  contextTokens?: number;
+  contextPrefillMs?: number;
+  contextCache?: { cached: number; partial: number; uncached: number; unknown: number };
   streams: DecodeBenchStreamResult[];
   model: string | null;
   /** ~1 Hz GPU/VRAM/power samples during the wave (debug). */
@@ -1228,6 +1276,8 @@ export interface DecodeBenchProgress {
   message: string;
   /** Generation tok/s measured from the streams of the running wave; null before the first token. */
   liveTps?: number | null;
+  /** Deep-context runs: streams prefilled so far for the current level. */
+  prefill?: { done: number; total: number } | null;
 }
 
 export interface DecodeBenchJob {
@@ -1252,6 +1302,8 @@ export interface DecodeBenchDefaults {
   defaultPromptType: DecodeBenchPromptType;
   defaultTemperature?: number;
   defaultThinking?: boolean;
+  minContextTokens?: number;
+  maxContextTokens?: number;
 }
 
 export interface DecodeBenchListResponse {
@@ -1273,6 +1325,8 @@ export interface StartDecodeBenchRequest {
   temperature?: number;
   /** Default true. */
   thinking?: boolean;
+  /** Prefill every stream with this many prompt tokens before the decode wave. 0 or omitted: start empty. */
+  contextTokens?: number;
   /** On-demand remote LLM host (hostname or URL). Skips this Spark's LAN/SSH path. */
   host?: string;
   tls?: boolean;
@@ -1340,6 +1394,7 @@ export interface PrefillBenchDefaults {
   allowedContextSizes: number[];
   defaultContextSizes: number[];
   minContextSize?: number;
+  /** Ceiling when the model's context is unknown. */
   maxContextSize?: number;
 }
 
@@ -1657,6 +1712,11 @@ export interface TokenHistoryRow {
    * Absent on data recorded before the flag existed (treated as reported).
    */
   cacheReported?: boolean;
+  /**
+   * Prompt tokens credited while the engine published no cached-prompt counter: neither
+   * cached nor computed. Absent on older data (then `cacheReported: false` means all of it).
+   */
+  unreportedPromptTokens?: number;
 }
 
 export interface TokenHistory {
