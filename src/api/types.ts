@@ -7,8 +7,16 @@ export interface SparkConfig {
    * - spark: NVIDIA DGX Spark (default) — DGX Spark specs shown in the header.
    * - host: any Linux box with supported NVIDIA or AMD GPUs, just not a Spark.
    *   Real hardware is auto-detected once online.
+   * - mac: an Apple Silicon Mac monitored over SSH with macOS tools
+   *   (sysctl, vm_stat, powermetrics) and the optional Mac node agent. Always remote.
    */
-  kind?: "spark" | "host";
+  kind?: "spark" | "host" | "mac";
+  /**
+   * Mac units only: read vitals + the runtime inventory from the on-device agent
+   * (`agents/macos/sparkdash_mac_agent.py --serve`) instead of SSH-only reads.
+   * Set `url` to override the whole endpoint, or `host`/`port` to build one.
+   */
+  agent?: MacAgentConfig | null;
   /**
    * Optional OS platform override for SSH-collected units. "linux" (default)
    * uses /proc + vendor GPU tooling, "darwin" macOS hosts, "windows" Windows hosts
@@ -269,8 +277,15 @@ export interface GpuMetricAvailability {
 export interface GpuMetrics {
   vendors?: Array<"amd" | "nvidia" | "intel">;
   metricAvailability?: GpuMetricAvailability;
-  temperature: number;
+  temperature: number | null;
+  thermal?: { pressureState: string; lastRecordedEvents: string[]; source: string } | null;
   usage: number;
+  /** Mac pressure label; agent and SSH sources differ (see agents/macos/README.md). */
+  thermalPressure?: string | null;
+  /** Mac units: false when `sudo -n powermetrics` is not permitted, so GPU activity and power are unknown. */
+  powermetricsAvailable?: boolean;
+  /** Mac-agent units: what this node could not read (e.g. gpu.power without root). */
+  unavailable?: MetricGap[];
   power: {
     draw: number;
     limit: number;
@@ -332,7 +347,11 @@ export interface GpuDevice {
 // ─── CPU metrics ─────────────────────────────────────────
 export interface CpuMetrics {
   usage: number;
-  temperature: number;
+  /** False when the CPU usage read was unavailable; the numeric placeholder is not a measured zero. */
+  usageAvailable?: boolean;
+  /** Availability entries from the same CPU sample. */
+  unavailable?: MetricGap[];
+  temperature: number | null;
   /** What the temperature reading is: "CPU", or "ACPI"/"SoC" for a board zone. */
   temperatureLabel?: string | null;
   /** Raw sensor name behind the reading (e.g. "acpitz", "coretemp"). */
@@ -694,6 +713,94 @@ export interface SparkMetrics {
   comfy?: ComfyMetrics | null;
   /** Tailnet probe result when monitoring is enabled; null when off or not yet polled. */
   tailscale?: TailscaleMetrics | null;
+  /**
+   * Mac-agent units: model runtimes detected on the machine. null for other
+   * transports (DGX Sparks, macs read over SSH) — an empty array only when the
+   * agent actually answered and found nothing serving.
+   */
+  runtimes?: MacRuntime[] | null;
+  /** Mac-agent units: metrics the node declared unavailable (never zeroed). */
+  unavailable?: MetricGap[] | null;
+  /** Mac-agent units: whether the agent answered the last runtime poll. */
+  agentOnline?: boolean | null;
+}
+
+// ─── Mac node agent ──────────────────────────────────────────
+export interface MacAgentConfig {
+  /** Full base URL, e.g. http://100.64.0.10:8790 (wins over host/port). */
+  url?: string | null;
+  /** Host to reach the agent on; defaults to the unit's probe host. */
+  host?: string | null;
+  /** Agent listen port (default 8790). */
+  port?: number | null;
+  /** Optional user-agent control port when telemetry uses a privileged collector. */
+  controlPort?: number | null;
+}
+
+/** One detected model runtime, from the Mac agent's data-driven inventory. */
+export interface MacRuntime {
+  /** Inventory name — e.g. "omlx", "splash-35b", "tensorfold", or "other-runtime". */
+  name: string;
+  /** Display label; for other-runtime this is the command basename. */
+  label: string;
+  /** "server" (owns a listener) or "watchdog" (a launcher, not serving). */
+  role: string;
+  pid: number;
+  command: string;
+  script?: string | null;
+  port: number | null;
+  /** Served model id when argv or the server's own API exposes one. */
+  model?: string | null;
+  /** "serving" (health path answered) | "listening" | "running". */
+  state: string;
+  detectedBy: string;
+  health?: { ok: boolean; url: string };
+}
+
+/** A metric this node could not read, with the reason shown in the UI. */
+export interface MetricGap {
+  metric: string;
+  reason: string;
+}
+
+/** One launchable catalog entry from the Mac agent's control endpoint. */
+export interface RuntimeControlTarget {
+  name: string;
+  label: string;
+  group: string;
+  groupLabel: string;
+  models: { id: string; label: string }[];
+  startable: boolean;
+  stoppable: boolean;
+  reason?: string | null;
+}
+
+/**
+ * Mac runtime control as the dashboard server reports it.
+ * `serving` is null when the probe did not answer — that is not "nothing serving".
+ */
+export interface RuntimeControlView {
+  state: "ready" | "unavailable" | "denied";
+  reason: string | null;
+  serving: MacRuntime[] | null;
+  targets: RuntimeControlTarget[];
+  error?: string | null;
+  output?: string | null;
+  ok?: boolean;
+  authorized?: boolean;
+  /** Browser transport failed; the action's outcome must be reconciled by polling. */
+  transportError?: boolean;
+  busy?: boolean;
+  operation?: {
+    id: string;
+    state: "running" | "complete";
+    runtime?: string;
+    model?: string;
+    action?: string;
+    ok?: boolean;
+    error?: string | null;
+    output?: string | null;
+  };
 }
 
 // ─── Spark snapshot (server pushes this) ──────────────────
@@ -709,13 +816,15 @@ export interface LlmMovedToWorker {
 
 export interface SparkSnapshot {
   id: string;
+  /** Configured Mac collection transport; independent of current agent reachability. */
+  macTransport?: "ssh" | "agent";
   /** Active health findings, most important first is not guaranteed; sort with sortFindings. */
   health?: HealthFinding[];
   name: string;
   /** Why the last liveness check failed, when offline. null/absent when online. */
   offlineReason?: string | null;
-  /** Unit type: spark (DGX Spark) or host (dedicated GPU Linux box). */
-  kind?: "spark" | "host";
+  /** Unit type: spark (DGX Spark), host (dedicated GPU Linux box), or mac (Apple Silicon). */
+  kind?: "spark" | "host" | "mac";
   /** OS of an SSH-collected unit; Windows units have no model launchers or CPU temperature. */
   platform?: "linux" | "darwin" | "windows";
   online: boolean;
@@ -900,6 +1009,40 @@ export interface FleetEnergy {
   nodeCoverage24hMs: Record<string, number>;
   nodeCoverage31dMs: Record<string, number>;
   hourlyWatts24h: Array<number | null>;
+  /** Wall power from external meters; present only while power meters are configured. */
+  wall?: FleetWallEnergy;
+}
+
+/**
+ * Wall power in the shape of FleetEnergy's own fields. Energy and coverage include time
+ * filled from the estimate (estimate × the node's learned wall/estimate ratio).
+ */
+export interface FleetWallEnergy {
+  /** Nodes with a meter. */
+  nodeIds: string[];
+  /** Metered nodes whose last reading is fresh. */
+  freshNodeIds: string[];
+  /** Nodes counted at estimate × ratio right now (no fresh reading, or no meter). */
+  filledNodeIds: string[];
+  staleNodeIds: string[];
+  /** Ratio used to fill each node (its own, else the fleet's); null = not learned yet. */
+  ratios: Record<string, number | null>;
+  ownRatios: Record<string, number | null>;
+  fleetRatio: number | null;
+  currentWatts30s: number | null;
+  /** True when the current figure includes filled nodes. */
+  currentFilled: boolean;
+  energy24hKwh: number | null;
+  filledEnergy24hKwh: number | null;
+  energy31dKwh: number | null;
+  whPerOutputToken24h: number | null;
+  coverage24hMs: number;
+  coverage24hWindowMs: number;
+  coverage31dMs: number;
+  coverage31dWindowMs: number;
+  nodeCoverage24hMs: Record<string, number>;
+  nodeCoverage31dMs: Record<string, number>;
+  hourlyWatts24h: Array<number | null>;
 }
 
 // ─── API responses ────────────────────────────────────────
@@ -1002,6 +1145,12 @@ export interface Settings {
   mqttUsername: string;
   /** Topic root for everything published (events, status, metrics). */
   mqttTopicPrefix: string;
+  /** Publish Home Assistant MQTT discovery configs (requires MQTT publishing). */
+  mqttDiscovery: boolean;
+  /** Discovery prefix — match the integration's setting in Home Assistant (default "homeassistant"). */
+  mqttDiscoveryPrefix: string;
+  /** Read-only API Keys page (LiteLLM keys via a host bridge). Off by default; while off there is no nav entry. */
+  apiKeysEnabled?: boolean;
   /**
    * Hide harness sessions older than this. Finite: 1 minute through 14 days.
    * Missing or out of range becomes 12 hours.
@@ -1063,6 +1212,8 @@ export interface OccupancyAdapterSummary {
   coverage: "supported" | "unsupported" | "unavailable" | "partial" | string;
   stale: boolean;
   rows: number;
+  /** Rows this adapter lost to the shared 500-row budget; 0 means all were included. */
+  dropped: number;
   error: string | null;
 }
 
@@ -1695,6 +1846,27 @@ export interface LauncherJobRead {
   truncated: boolean;
 }
 
+// ─── Model discovery ("Discover on this Spark") ───
+/** A model the discovery scan found on the dashboard's own Spark. */
+export type ModelCandidateKind = "scripted" | "ollama" | "huggingface";
+
+export interface ModelCandidate {
+  kind: ModelCandidateKind;
+  name: string;
+  /** Absolute folder (scripted) or cache dir (huggingface); ollama has none. */
+  directory?: string;
+  startScript?: string;
+  stopScript?: string | null;
+  /** Ollama weights only: human size string from `ollama list`. */
+  size?: string;
+}
+
+export interface ModelDiscoveryResponse {
+  candidates: ModelCandidate[];
+  scannedRoots: string[];
+  notes: string[];
+}
+
 // ─── Detailed fleet pages: history APIs ───
 /** One bucket of token traffic for one (Spark, port, model). `t` is a UTC date ("2026-10-07") or UTC hour ("2026-10-07T14"). */
 export interface TokenHistoryRow {
@@ -1738,6 +1910,26 @@ export interface EnergyHistoryRow {
   fleetCoverageMs: number;
   outputTokens: number;
   coveredOutputTokens: number;
+  // ── Optional, present only in hours that have them ──
+  /** GPU board draw as measured, per node. */
+  nodeGpuWh?: Record<string, number>;
+  /** CPU draw as modelled from utilization, per node. */
+  nodeCpuWh?: Record<string, number>;
+  nodePartsCoverageMs?: Record<string, number>;
+  /** Wall energy a meter measured, per node. */
+  nodeWallWh?: Record<string, number>;
+  nodeWallCoverageMs?: Record<string, number>;
+  /** Part of the measured coverage the meter's own record confirmed. */
+  nodeWallMeteredMs?: Record<string, number>;
+  /** Wall energy filled from the estimate where no meter measured. */
+  nodeWallFilledWh?: Record<string, number>;
+  nodeWallFilledMs?: Record<string, number>;
+  /** Fleet wall figures, measured plus filled, while every node was covered. */
+  avgWallWatts?: number | null;
+  fleetWallWh?: number;
+  fleetWallFilledWh?: number;
+  fleetWallCoverageMs?: number;
+  wallCoveredOutputTokens?: number;
 }
 
 export interface EnergyHistory {
@@ -1746,6 +1938,9 @@ export interface EnergyHistory {
   generatedAt: number;
   retentionMs: number;
   nodeIds: string[];
+  /** Present only while power meters are configured. */
+  wallNodeIds?: string[];
+  wallRatios?: Record<string, number | null>;
   hourly: EnergyHistoryRow[];
 }
 
@@ -1760,13 +1955,34 @@ export interface MonthlyEnergyMonth {
   closed: boolean;
   /** Nodes that reported in this month (the scope at the time). */
   nodeIds: string[];
-  nodes: Record<string, { wh: number; coverageMs: number }>;
+  nodes: Record<string, MonthlyEnergyNode>;
   totalWh: number;
   fleetWh: number;
   fleetCoverageMs: number;
   outputTokens: number;
   coveredOutputTokens: number;
   whPerOutputToken: number | null;
+  // ── Present only in months with wall power (measured or filled) ──
+  totalWallWh?: number;
+  totalWallFilledWh?: number;
+  fleetWallWh?: number;
+  fleetWallFilledWh?: number;
+  fleetWallCoverageMs?: number;
+  wallCoveredOutputTokens?: number;
+  wallWhPerOutputToken?: number | null;
+}
+
+export interface MonthlyEnergyNode {
+  wh: number;
+  coverageMs: number;
+  gpuWh?: number;
+  cpuWh?: number;
+  partsCoverageMs?: number;
+  wallWh?: number;
+  wallCoverageMs?: number;
+  wallMeteredMs?: number;
+  wallFilledWh?: number;
+  wallFilledMs?: number;
 }
 
 export interface MonthlyEnergy {

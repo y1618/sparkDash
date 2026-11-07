@@ -72,16 +72,25 @@ import { planListenRetry } from "./listenRetry.js";
 import { UnitHistory } from "./metrics/UnitHistory.js";
 import { createUnitHistoryRuntime, registerUnitHistoryRoutes } from "./metrics/UnitHistoryRuntime.js";
 import { LauncherStore } from "./llmlaunch/LauncherStore.js";
-import { LauncherManager } from "./llmlaunch/LauncherManager.js";
+import { LauncherManager, defaultExec } from "./llmlaunch/LauncherManager.js";
+import { discoverModelCandidates } from "./models/discovery.js";
 import { ToolEvalStore } from "./tooleval/ToolEvalStore.js";
 import { ToolEvalManager } from "./tooleval/ToolEvalManager.js";
 import { registerToolEvalRoutes } from "./tooleval/routes.js";
+import { registerApiKeysRoutes } from "./apiKeys/routes.js";
 import { benchEvent } from "./events/eventFormat.js";
 import {
   createFleetEnergyRuntime,
   registerFleetEnergyRoute,
 } from "./energy/FleetEnergyRuntime.js";
+import { createPowerMeterRuntime } from "./powermeter/runtime.js";
 import { testSparkConnectivity } from "./connectivity.js";
+import {
+  beginRuntimeControl,
+  assertMacControlSpark,
+  readRuntimeControl,
+  runtimeControlHttpStatus,
+} from "./collectors/MacRuntimeControl.js";
 import { TailscaleProbe } from "./collectors/TailscaleProbe.js";
 import { inspectStartupPreflight, logStartupPreflight } from "./startupPreflight.js";
 import { readServerVersion } from "./serverVersion.js";
@@ -466,10 +475,19 @@ function orderedSnapshots() {
     });
 }
 
+// Wall power from external meters (smart strips, PDUs, Home Assistant), recorded by the
+// fleet-energy tracker beside its estimate. Opt-in: inert unless config/power-meters.json exists.
+const powerMeters = createPowerMeterRuntime({
+  tracker: fleetEnergyTracker,
+  listUnits: () => registry.sparks,
+  recordEvent,
+});
+
 const fleetEnergyRuntime = createFleetEnergyRuntime({
   tracker: fleetEnergyTracker,
   orderedSnapshots,
   monitors,
+  wallReadings: powerMeters.wallReadings,
 });
 
 const unitHistoryRuntime = createUnitHistoryRuntime({
@@ -573,6 +591,7 @@ function clientKey(req) {
 
 // ─── REST API ────────────────────────────────────────────
 registerFleetEnergyRoute(app, fleetEnergyTracker);
+powerMeters.register(app);
 registerLlmTokenTotalsRoute(app, llmTokenLedger);
 app.get("/api/model-prices", createModelPricesHandler());
 registerAlertRoutes(app, alertsRuntime);
@@ -802,6 +821,33 @@ app.get("/api/sparks/:id/metrics", (req, res) => {
   res.json(withMovedEngineHint(monitor.snapshot()));
 });
 
+app.get("/api/sparks/:id/runtime-control", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  const blocked = assertMacControlSpark(spark);
+  if (blocked) return res.status(blocked.status).json(blocked.body);
+  try {
+    const result = await readRuntimeControl(spark);
+    res.status(runtimeControlHttpStatus(result)).json(result);
+  } catch (err) {
+    res.status(503).json({ state: "unavailable", reason: err.message, error: err.message, serving: null, targets: [] });
+  }
+});
+
+app.post("/api/sparks/:id/runtime-control/:action", async (req, res) => {
+  if (!allowDestructive(principalKey(req)) || !allowGlobalDestructive(clientKey(req))) {
+    return rejectLimited(res, "Too many runtime control requests; try again shortly");
+  }
+  const spark = registry.getSpark(req.params.id);
+  const blocked = assertMacControlSpark(spark);
+  if (blocked) return res.status(blocked.status).json(blocked.body);
+  try {
+    const result = await beginRuntimeControl(spark, req.params.action, req.body || {});
+    res.status(result.state === "ready" && result.busy ? 202 : runtimeControlHttpStatus(result)).json(result);
+  } catch (err) {
+    res.status(503).json({ state: "unavailable", reason: err.message, error: err.message, serving: null, targets: [] });
+  }
+});
+
 // Test SSH + LLM connectivity for a registered Spark.
 // Optional body.ssh.password is ALWAYS saved (even if the host is down).
 app.post("/api/sparks/:id/test", async (req, res) => {
@@ -843,6 +889,16 @@ registerToolEvalRoutes(app, {
   manager: toolEvalManager,
   store: toolEvalStore,
   allowRun: allowToolEval,
+  principalKey,
+  rejectLimited,
+});
+
+// ─── API Keys (opt-in, Settings → API Keys) ───
+// Read-only views of LiteLLM virtual keys through a host-side bridge on a unix socket
+// (SPARKDASH_APIKEYS_BRIDGE_SOCKET / SPARKDASH_APIKEYS_BRIDGE_TOKEN). 404 while the setting is off.
+registerApiKeysRoutes(app, {
+  getSettings,
+  allow: createRateLimiter(60, 60_000),
   principalKey,
   rejectLimited,
 });
@@ -960,6 +1016,47 @@ for (const action of ["start", "stop", "attach"]) {
     res.status(202).json({ job: result.job });
   });
 }
+
+// ─── Model discovery: "Discover on this Spark" ───────────
+// Scans the unit sparkDash itself runs on (LOCAL-UNIT ONLY — the same local-
+// identity rule the power actions follow; remote units are never scanned).
+// The scan runs the FIXED templates from models/discovery.js through the
+// launcher's host-user drop (refuses root); no text from this request — and
+// nothing the browser can influence at all — reaches a shell string.
+// Cached 15 s so reopening the dialog does not re-scan the filesystem.
+
+const MODEL_DISCOVERY_CACHE_TTL_MS = 15_000;
+/** @type {{ at: number, payload: object } | null} */
+let modelDiscoveryCache = null;
+
+app.get("/api/model-launcher/discover", async (req, res) => {
+  try {
+    if (!allowLaunchProbe(principalKey(req))) {
+      return rejectLimited(res, "Too many discovery requests; try again shortly");
+    }
+    const spark = registry.sparks.find((s) => s.isLocal);
+    if (!spark) {
+      return res.status(400).json({
+        error: "Discovery scans the Spark that runs this dashboard. Add this machine as a Spark first.",
+      });
+    }
+    if (spark.platform === "windows") {
+      return res.status(400).json({ error: "Model discovery is not supported on Windows PCs" });
+    }
+    const now = Date.now();
+    if (modelDiscoveryCache && now - modelDiscoveryCache.at < MODEL_DISCOVERY_CACHE_TTL_MS) {
+      return res.json(modelDiscoveryCache.payload);
+    }
+    const payload = await discoverModelCandidates({
+      execHost: (cmd, timeoutMs) => defaultExec(spark, cmd, timeoutMs),
+      sshUser: spark.ssh?.user,
+    });
+    modelDiscoveryCache = { at: now, payload };
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
 
 // Cancel a ComfyUI job (running interrupt and/or pending dequeue).
 app.post("/api/sparks/:id/comfy/cancel", async (req, res) => {
@@ -2294,7 +2391,7 @@ app.get("/metrics", (_req, res) => {
   // res.end, not res.send: send() reorders the media type parameters; keep the
   // header exactly as the exposition format spells it.
   res.setHeader("Content-Type", PROMETHEUS_CONTENT_TYPE);
-  res.end(renderPrometheusMetrics(entries));
+  res.end(renderPrometheusMetrics(entries) + powerMeters.renderPrometheus());
 });
 
 // ─── Static files (built frontend) ───────────────────────
@@ -2587,6 +2684,7 @@ if (!startupPreflight.fatal) {
     alertsRuntime.start();
     occupancy.start();
     fleetEnergyRuntime.start();
+    powerMeters.start();
     llmTokenRuntime.start();
   }
 } else {
@@ -2645,6 +2743,11 @@ async function shutdown(signal) {
     await occupancy.stop();
   } catch (err) {
     console.error("[sparkDash] failed to stop occupancy poller:", err.message);
+  }
+  try {
+    powerMeters.stop();
+  } catch (err) {
+    console.error("[sparkDash] failed to stop power meters:", err.message);
   }
   const energyPersistenceSucceeded = fleetEnergyRuntime.stop();
   const [streamAgentClosedGracefully] = await Promise.all([closeLlmStreamAgent(), mqttStopped]);
